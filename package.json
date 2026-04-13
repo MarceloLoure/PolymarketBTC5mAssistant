@@ -9,9 +9,11 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "ethers": "^6.11.1",
+    "exceljs": "^4.4.0",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",
     "undici": "^6.21.3",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "xlsx": "^0.18.5"
   }
 }

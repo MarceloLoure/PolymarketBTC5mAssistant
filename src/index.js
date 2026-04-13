@@ -13,6 +13,7 @@ import {
   fetchOrderBook,
   summarizeOrderBook
 } from "./data/polymarket.js";
+import { localAdvisor, formatAdvisorLine } from "./engines/localAdvisor.js";
 import { computeSessionVwap, computeVwapSeries } from "./indicators/vwap.js";
 import { computeRsi, sma, slopeLast } from "./indicators/rsi.js";
 import { computeMacd } from "./indicators/macd.js";
@@ -21,11 +22,61 @@ import { detectRegime } from "./engines/regime.js";
 import { scoreDirection, applyTimeAwareness } from "./engines/probability.js";
 import { computeEdge, decide } from "./engines/edge.js";
 import { appendCsvRow, formatNumber, formatPct, getCandleWindowTiming, sleep } from "./utils.js";
+import { createTradeJournal } from "./tradeJournal.js";
 import { startBinanceTradeStream } from "./data/binanceWs.js";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { applyGlobalProxyFromEnv } from "./net/proxy.js";
+
+const CANDLE_CACHE_FILE_5M = "./logs/klines_5m.json";
+const CANDLE_CACHE_LIMIT_5M = 100;
+
+function loadLocalKlines(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return [];
+    const raw = fs.readFileSync(filePath, "utf8");
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data)) return [];
+    return data
+      .filter((c) => c && Number.isFinite(c.openTime) && Number.isFinite(c.closeTime))
+      .map((c) => ({
+        openTime: Number(c.openTime),
+        open: Number(c.open),
+        high: Number(c.high),
+        low: Number(c.low),
+        close: Number(c.close),
+        volume: Number(c.volume),
+        closeTime: Number(c.closeTime)
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalKlines(filePath, klines) {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, JSON.stringify(klines, null, 2), "utf8");
+  } catch {
+    // ignore
+  }
+}
+
+function mergeKlines(base, incoming, limit) {
+  const map = new Map();
+  for (const c of base || []) {
+    if (!c || !Number.isFinite(c.openTime)) continue;
+    map.set(c.openTime, c);
+  }
+  for (const c of incoming || []) {
+    if (!c || !Number.isFinite(c.openTime)) continue;
+    map.set(c.openTime, c);
+  }
+  const merged = Array.from(map.values())
+    .sort((a, b) => a.openTime - b.openTime);
+  return merged.slice(-limit);
+}
 
 function countVwapCrosses(closes, vwapSeries, lookback) {
   if (closes.length < lookback || vwapSeries.length < lookback) return null;
@@ -183,6 +234,26 @@ function fmtEtTime(now = new Date()) {
   } catch {
     return "-";
   }
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function formatWindowLabel(startMs, endMs) {
+  const start = new Date(startMs);
+  const end = new Date(endMs);
+  return `${pad2(start.getHours())}:${pad2(start.getMinutes())} a ${pad2(end.getHours())}:${pad2(end.getMinutes())}`;
+}
+
+function pickClosePrice(candles, targetMs) {
+  if (!Array.isArray(candles) || !candles.length) return null;
+  for (let i = candles.length - 1; i >= 0; i -= 1) {
+    const c = candles[i];
+    if (!c || !Number.isFinite(c.closeTime)) continue;
+    if (c.closeTime <= targetMs) return Number.isFinite(c.close) ? c.close : null;
+  }
+  return null;
 }
 
 function getBtcSession(now = new Date()) {
@@ -401,9 +472,17 @@ async function main() {
   const polymarketLiveStream = startPolymarketChainlinkPriceStream({});
   const chainlinkStream = startChainlinkPriceStream({});
 
+  const tradeJournal = createTradeJournal({});
+
+  let localKlines5m = loadLocalKlines(CANDLE_CACHE_FILE_5M);
+
   let prevSpotPrice = null;
   let prevCurrentPrice = null;
   let priceToBeatState = { slug: null, value: null, setAtMs: null };
+  let lastWindowStartMs = null;
+  let lastEntry = null;
+  let lastEntryWindowEndMs = null;
+  const pendingSignals = new Map();
 
   const header = [
     "timestamp",
@@ -417,7 +496,9 @@ async function main() {
     "mkt_down",
     "edge_up",
     "edge_down",
-    "recommendation"
+    "recommendation",
+    "final_price",
+    "final_result"
   ];
 
   while (true) {
@@ -439,20 +520,25 @@ async function main() {
           ? Promise.resolve({ price: chainlinkWsPrice, updatedAt: chainlinkWsTick?.updatedAt ?? null, source: "chainlink_ws" })
           : fetchChainlinkBtcUsd();
 
-      const [klines1m, klines5m, lastPrice, chainlink, poly] = await Promise.all([
-        fetchKlines({ interval: "1m", limit: 240 }),
+      const [klines5m, lastPrice, chainlink, poly] = await Promise.all([
         fetchKlines({ interval: "5m", limit: 200 }),
         fetchLastPrice(),
         chainlinkPromise,
         fetchPolymarketSnapshot()
       ]);
 
+      const merged5m = mergeKlines(localKlines5m, klines5m, CANDLE_CACHE_LIMIT_5M);
+      if (merged5m.length) {
+        localKlines5m = merged5m;
+        saveLocalKlines(CANDLE_CACHE_FILE_5M, localKlines5m);
+      }
+
       const settlementMs = poly.ok && poly.market?.endDate ? new Date(poly.market.endDate).getTime() : null;
       const settlementLeftMin = settlementMs ? (settlementMs - Date.now()) / 60_000 : null;
 
       const timeLeftMin = settlementLeftMin ?? timing.remainingMinutes;
 
-      const candles = klines1m;
+      const candles = localKlines5m.length ? localKlines5m : klines5m;
       const closes = candles.map((c) => c.close);
 
       const vwap = computeSessionVwap(candles);
@@ -478,6 +564,9 @@ async function main() {
       const ha = computeHeikenAshi(candles);
       const consec = countConsecutive(ha);
 
+      const ha5m    = computeHeikenAshi(klines5m);
+      const consec5m = countConsecutive(ha5m);
+
       const vwapCrossCount = countVwapCrosses(closes, vwapSeries, 20);
       const volumeRecent = candles.slice(-20).reduce((a, c) => a + c.volume, 0);
       const volumeAvg = candles.slice(-120).reduce((a, c) => a + c.volume, 0) / 6;
@@ -496,15 +585,21 @@ async function main() {
       });
 
       const scored = scoreDirection({
-        price: lastPrice,
-        vwap: vwapNow,
+        price:            lastPrice,
+        vwap:             vwapNow,
         vwapSlope,
-        rsi: rsiNow,
+        rsi:              rsiNow,
         rsiSlope,
         macd,
-        heikenColor: consec.color,
-        heikenCount: consec.count,
-        failedVwapReclaim
+        heikenColor:      consec.color,
+        heikenCount:      consec.count,
+        heikenColor5m:    consec5m.color,     // NOVO: confirmação 5m
+        heikenCount5m:    consec5m.count,     // NOVO
+        failedVwapReclaim,
+        priceToBeat:      priceToBeatState.value,  // NOVO: fator chave
+        volume20:         volumeRecent,        // já calculado mais acima
+        volumeAvg,                             // já calculado mais acima
+        regime:           regimeInfo.regime    // NOVO: regime-aware
       });
 
       const timeAware = applyTimeAwareness(scored.rawUp, timeLeftMin, CONFIG.candleWindowMinutes);
@@ -513,7 +608,18 @@ async function main() {
       const marketDown = poly.ok ? poly.prices.down : null;
       const edge = computeEdge({ modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown, marketYes: marketUp, marketNo: marketDown });
 
-      const rec = decide({ remainingMinutes: timeLeftMin, edgeUp: edge.edgeUp, edgeDown: edge.edgeDown, modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown });
+      const rec = decide({
+        remainingMinutes: timeLeftMin,
+        edgeUp:           edge.edgeUp,
+        edgeDown:         edge.edgeDown,
+        modelUp:          timeAware.adjustedUp,
+        modelDown:        timeAware.adjustedDown,
+        score:            scored.score,        // NOVO: score de confluência
+        bullCount:        scored.bullCount,    // NOVO
+        bearCount:        scored.bearCount,    // NOVO
+        totalSignals:     scored.totalSignals, // NOVO
+        regime:           regimeInfo.regime    // NOVO
+      });
 
       const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
 
@@ -523,12 +629,12 @@ async function main() {
           ? (macd.histDelta !== null && macd.histDelta < 0 ? "bearish (expanding)" : "bearish")
           : (macd.histDelta !== null && macd.histDelta > 0 ? "bullish (expanding)" : "bullish");
 
-      const lastCandle = klines1m.length ? klines1m[klines1m.length - 1] : null;
+      const lastCandle = candles.length ? candles[candles.length - 1] : null;
       const lastClose = lastCandle?.close ?? null;
-      const close1mAgo = klines1m.length >= 2 ? klines1m[klines1m.length - 2]?.close ?? null : null;
-      const close3mAgo = klines1m.length >= 4 ? klines1m[klines1m.length - 4]?.close ?? null : null;
-      const delta1m = lastClose !== null && close1mAgo !== null ? lastClose - close1mAgo : null;
-      const delta3m = lastClose !== null && close3mAgo !== null ? lastClose - close3mAgo : null;
+      const close5mAgo = candles.length >= 2 ? candles[candles.length - 2]?.close ?? null : null;
+      const close15mAgo = candles.length >= 4 ? candles[candles.length - 4]?.close ?? null : null;
+      const delta5m = lastClose !== null && close5mAgo !== null ? lastClose - close5mAgo : null;
+      const delta15m = lastClose !== null && close15mAgo !== null ? lastClose - close15mAgo : null;
 
       const haNarrative = (consec.color ?? "").toLowerCase() === "green" ? "LONG" : (consec.color ?? "").toLowerCase() === "red" ? "SHORT" : "NEUTRAL";
       const rsiNarrative = narrativeFromSlope(rsiSlope);
@@ -556,10 +662,10 @@ async function main() {
 
       const macdLine = formatNarrativeValue("MACD", macdLabel, macdNarrative);
 
-      const delta1Narrative = narrativeFromSign(delta1m);
-      const delta3Narrative = narrativeFromSign(delta3m);
-      const deltaValue = `${colorByNarrative(formatSignedDelta(delta1m, lastClose), delta1Narrative)} | ${colorByNarrative(formatSignedDelta(delta3m, lastClose), delta3Narrative)}`;
-      const deltaLine = `Delta 1/3Min: ${deltaValue}`;
+      const delta5Narrative = narrativeFromSign(delta5m);
+      const delta15Narrative = narrativeFromSign(delta15m);
+      const deltaValue = `${colorByNarrative(formatSignedDelta(delta5m, lastClose), delta5Narrative)} | ${colorByNarrative(formatSignedDelta(delta15m, lastClose), delta15Narrative)}`;
+      const deltaLine = `Delta 5/15Min: ${deltaValue}`;
 
       const vwapValue = `${formatNumber(vwapNow, 0)} (${formatPct(vwapDist, 2)}) | slope: ${vwapSlopeLabel}`;
       const vwapLine = formatNarrativeValue("VWAP", vwapValue, vwapNarrative);
@@ -569,8 +675,8 @@ async function main() {
         { name: "rsi", narrative: rsiNarrative, weight: 1.0 },
         { name: "macd", narrative: macdNarrative, weight: 1.0 },
         { name: "vwap", narrative: vwapNarrative, weight: 1.0 },
-        { name: "delta1", narrative: delta1Narrative, weight: 0.5 },
-        { name: "delta3", narrative: delta3Narrative, weight: 0.5 }
+        { name: "delta5", narrative: delta5Narrative, weight: 0.5 },
+        { name: "delta15", narrative: delta15Narrative, weight: 0.5 }
       ];
 
       let indicatorScore = 0;
@@ -595,6 +701,11 @@ async function main() {
           : `${ANSI.gray}NEUTRAL${ANSI.reset}`;
       const biasScoreText = `${combinedScore >= 0 ? "+" : ""}${combinedScore.toFixed(2)}`;
       const biasLine = `${biasText} (${biasScoreText})`;
+      const biasActionText = biasNarrative === "LONG"
+        ? `${ANSI.green}COMPRAR${ANSI.reset}`
+        : biasNarrative === "SHORT"
+          ? `${ANSI.red}VENDER${ANSI.reset}`
+          : `${ANSI.gray}NEUTRO${ANSI.reset}`;
 
       const signal = rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE";
 
@@ -602,10 +713,22 @@ async function main() {
         ? `${rec.action} NOW (${rec.phase} ENTRY)`
         : `NO TRADE (${rec.phase})`;
       const recommendationText = rec.action === "ENTER"
-        ? (rec.side === "UP"
-          ? `${ANSI.green}COMPRAR (UP)${ANSI.reset}`
-          : `${ANSI.red}VENDER (DOWN)${ANSI.reset}`)
+        ? `${ANSI.green}TRADE REALIZADO${ANSI.reset}`
         : `${ANSI.gray}SEM TRADE${ANSI.reset}`;
+
+      const liveEntryStatus = (() => {
+        if (!lastEntry) return null;
+        const currentTokenPrice = lastEntry.side === "UP"
+          ? (poly.ok ? poly.prices.up : null)
+          : (poly.ok ? poly.prices.down : null);
+        if (!Number.isFinite(currentTokenPrice) || !Number.isFinite(lastEntry.entryPrice)) return null;
+        const delta = currentTokenPrice - lastEntry.entryPrice;
+        const isWin = delta >= 0;
+        const color = isWin ? ANSI.green : ANSI.red;
+        const label = isWin ? "GANHANDO" : "PERDENDO";
+        const cents = (Math.abs(delta) * 100).toFixed(2);
+        return `${color}${label} ${cents}¢${ANSI.reset}`;
+      })();
 
       const spreadUp = poly.ok ? poly.orderbook.up.spread : null;
       const spreadDown = poly.ok ? poly.orderbook.down.spread : null;
@@ -619,6 +742,63 @@ async function main() {
       const currentPrice = chainlink?.price ?? null;
       const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
       const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
+
+      if (lastWindowStartMs !== null && timing.startMs !== lastWindowStartMs) {
+        tradeJournal.closeWindow({
+          windowEndMs: timing.startMs,
+          candles,
+          fallbackPrice: currentPrice ?? spotPrice,
+          outcomePrices: {
+            up: poly.ok ? poly.prices.up : null,
+            down: poly.ok ? poly.prices.down : null
+          }
+        });
+        tradeJournal.maybeSuggestParams();
+        lastEntry = null;
+
+        const pending = pendingSignals.get(timing.startMs);
+        if (pending) {
+          const btcClose = pickClosePrice(candles, timing.startMs) ?? (Number.isFinite(currentPrice) ? currentPrice : spotPrice);
+          const strike = Number.isFinite(pending.strikeAtOpen) ? pending.strikeAtOpen : null;
+          let result = "";
+          if (Number.isFinite(btcClose) && strike !== null) {
+            result = pending.side === "UP"
+              ? (btcClose > strike ? "GANHO" : "PERDA")
+              : (btcClose < strike ? "GANHO" : "PERDA");
+          }
+          appendCsvRow("./logs/signals.csv", header, [
+            pending.timestamp,
+            pending.entry_minute,
+            pending.time_left_min,
+            pending.regime,
+            pending.signal,
+            pending.model_up,
+            pending.model_down,
+            pending.mkt_up,
+            pending.mkt_down,
+            pending.edge_up,
+            pending.edge_down,
+            pending.recommendation,
+            btcClose ?? "",
+            result
+          ]);
+          pendingSignals.delete(timing.startMs);
+        }
+      }
+      lastWindowStartMs = timing.startMs;
+
+      const candleOpen = lastCandle?.open ?? null;
+      const refPriceForOpen = currentPrice ?? spotPrice;
+      let openSignalText = `${ANSI.gray}NEUTRO${ANSI.reset}`;
+      if (candleOpen !== null && refPriceForOpen !== null && Number.isFinite(candleOpen) && Number.isFinite(refPriceForOpen)) {
+        if (refPriceForOpen > candleOpen) {
+          openSignalText = `${ANSI.green}COMPRAR (acima da abertura)${ANSI.reset}`;
+        } else if (refPriceForOpen < candleOpen) {
+          openSignalText = `${ANSI.red}VENDER (abaixo da abertura)${ANSI.reset}`;
+        } else {
+          openSignalText = `${ANSI.gray}NEUTRO (na abertura)${ANSI.reset}`;
+        }
+      }
 
       if (marketSlug && priceToBeatState.slug !== marketSlug) {
         priceToBeatState = { slug: marketSlug, value: null, setAtMs: null };
@@ -656,6 +836,16 @@ async function main() {
         : `${ptbDeltaColor}${ptbDelta > 0 ? "+" : ptbDelta < 0 ? "-" : ""}$${Math.abs(ptbDelta).toFixed(2)}${ANSI.reset}`;
       const currentPriceValue = currentPriceBaseLine.split(": ")[1] ?? currentPriceBaseLine;
       const currentPriceLine = kv("CURRENT PRICE:", `${currentPriceValue} (${ptbDeltaText})`);
+      
+      const signalSummaryLine = (() => {
+        const details = scored.signalDetails ?? [];
+        const ups   = details.filter(s => s.direction === "UP").map(s => s.name).join(" ");
+        const downs = details.filter(s => s.direction === "DOWN").map(s => s.name).join(" ");
+        const scoreText = scored.score >= 0
+          ? `${ANSI.green}+${scored.score.toFixed(2)}${ANSI.reset}`
+          : `${ANSI.red}${scored.score.toFixed(2)}${ANSI.reset}`;
+        return `UP:[${ups || "-"}]  DOWN:[${downs || "-"}]  score:${scoreText}`;
+      })();
 
       if (poly.ok && poly.market && priceToBeatState.value === null) {
         const slug = safeFileSlug(poly.market.slug || poly.market.id || "market");
@@ -667,6 +857,69 @@ async function main() {
           } catch {
             // ignore
           }
+        }
+      }
+
+      const advisor = localAdvisor({
+        remainingMinutes: timeLeftMin,
+        score:            scored.score,
+        bullCount:        scored.bullCount,
+        bearCount:        scored.bearCount,
+        marketUp:   marketUp,
+        marketDown: marketDown,
+        modelUp:          timeAware.adjustedUp,
+        modelDown:        timeAware.adjustedDown,
+        currentPrice,
+        priceToBeat:      priceToBeatState.value,
+        regime:           regimeInfo.regime,
+        spread
+      });
+      
+      const advisorLine = formatAdvisorLine(advisor, ANSI);
+
+      if (rec.action === "ENTER") {
+        if (lastEntryWindowEndMs === timing.endMs) {
+          // já entrou neste candle
+        } else {
+        const entryPrice = rec.side === "UP"
+          ? (poly.ok ? poly.prices.up : null)
+          : (poly.ok ? poly.prices.down : null);
+        const safeEntryPrice = Number.isFinite(entryPrice) ? entryPrice : (currentPrice ?? spotPrice);
+        const modelProb = rec.side === "UP" ? timeAware.adjustedUp : timeAware.adjustedDown;
+        const signals = rec.side === "UP" ? scored.bullCount : scored.bearCount;
+        console.log(`[ENTRY] ${new Date().toISOString()} side=${rec.side} price=${safeEntryPrice} phase=${rec.phase} edge=${rec.edge ?? "-"} score=${scored.score} window=${formatWindowLabel(timing.startMs, timing.endMs)} market=${marketSlug || "-"}`);
+        lastEntry = { side: rec.side, entryPrice: safeEntryPrice };
+        lastEntryWindowEndMs = timing.endMs;
+        tradeJournal.openEntry({
+          windowStartMs: timing.startMs,
+          windowEndMs: timing.endMs,
+          entryPrice: safeEntryPrice,
+          strikeAtOpen: priceToBeatState.value,
+          side: rec.side,
+          edge: rec.edge ?? null,
+          modelProb,
+          score: scored.score,
+          signals,
+          phase: rec.phase,
+          marketSlug
+        });
+
+        pendingSignals.set(timing.endMs, {
+          timestamp: new Date().toISOString(),
+          entry_minute: Number.isFinite(timing.elapsedMinutes) ? timing.elapsedMinutes.toFixed(3) : "",
+          time_left_min: Number.isFinite(timeLeftMin) ? timeLeftMin.toFixed(3) : "",
+          regime: regimeInfo.regime,
+          signal,
+          model_up: timeAware.adjustedUp,
+          model_down: timeAware.adjustedDown,
+          mkt_up: marketUp,
+          mkt_down: marketDown,
+          edge_up: edge.edgeUp,
+          edge_down: edge.edgeDown,
+          recommendation: `${rec.side}:${rec.phase}:${rec.strength}`,
+          side: rec.side,
+          strikeAtOpen: priceToBeatState.value
+        });
         }
       }
 
@@ -695,6 +948,21 @@ async function main() {
             : ANSI.reset;
       const timeLeftLine = `⏱ Tempo restante: ${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`;
 
+      const entryGateText = `${ANSI.green}LIBERADO (a qualquer momento)${ANSI.reset}`;
+
+      function formatTimedWindow(windowMin) {
+        if (timeLeftMin === null || !Number.isFinite(timeLeftMin)) return `${ANSI.gray}-${ANSI.reset}`;
+        if (timeLeftMin <= windowMin && timeLeftMin > windowMin - 1) {
+          return `${ANSI.green}AGORA${ANSI.reset} ${biasActionText}`;
+        }
+        if (timeLeftMin <= windowMin - 1) {
+          return `${ANSI.gray}PASSOU${ANSI.reset}`;
+        }
+        return `${ANSI.yellow}AGUARDE${ANSI.reset}`;
+      }
+      const rec4m = formatTimedWindow(4);
+      const rec3m = formatTimedWindow(3);
+
       const polyTimeLeftColor = settlementLeftMin !== null
         ? (settlementLeftMin >= 10 && settlementLeftMin <= 15
           ? ANSI.green
@@ -705,6 +973,17 @@ async function main() {
               : ANSI.reset)
         : ANSI.reset;
 
+      const polyBlock = [
+        kv("POLYMARKET:", polyHeaderValue),
+        kv("Recomendacao:", recommendationText),
+        liveEntryStatus ? kv("Status Trade:", liveEntryStatus) : null,
+        kv("Advisor:", advisorLine),
+        liquidity !== null ? kv("Liquidez:", formatNumber(liquidity, 0)) : null,
+        settlementLeftMin !== null ? kv("Tempo restante:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
+        priceToBeat !== null ? kv("PRECO A SUPERAR:", `$${formatNumber(priceToBeat, 0)}`) : kv("PRECO A SUPERAR:", `${ANSI.gray}-${ANSI.reset}`),
+        currentPriceLine
+      ].filter((x) => x !== null);
+
       const lines = [
         titleLine,
         marketLine,
@@ -714,25 +993,21 @@ async function main() {
         "",
         kv("TA Prev:", predictValue),
         kv("Vies (Modelo+Ind):", biasLine),
+        kv("Sinal Abertura 5m:", openSignalText),
+        kv("Entrada (Janela):", entryGateText),
+        kv("Recomendacao 4m:", rec4m),
+        kv("Recomendacao 3m:", rec3m),
+        kv("Sinais:", signalSummaryLine),
         kv("Heiken Ashi:", heikenLine.split(": ")[1] ?? heikenLine),
         kv("RSI:", rsiLine.split(": ")[1] ?? rsiLine),
         kv("MACD:", macdLine.split(": ")[1] ?? macdLine),
-        kv("Delta 1/3:", deltaLine.split(": ")[1] ?? deltaLine),
+        kv("Delta 5/15:", deltaLine.split(": ")[1] ?? deltaLine),
         kv("VWAP:", vwapLine.split(": ")[1] ?? vwapLine),
         rec.action === "NO_TRADE" && rec.reason ? kv("Motivo Sem Trade:", String(rec.reason)) : null,
         "",
         sepLine(),
         "",
-        kv("POLYMARKET:", polyHeaderValue),
-        kv("Recomendacao:", recommendationText),
-        liquidity !== null ? kv("Liquidez:", formatNumber(liquidity, 0)) : null,
-        settlementLeftMin !== null ? kv("Tempo restante:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
-        priceToBeat !== null ? kv("PRECO A SUPERAR:", `$${formatNumber(priceToBeat, 0)}`) : kv("PRECO A SUPERAR:", `${ANSI.gray}-${ANSI.reset}`),
-        currentPriceLine,
-        "",
-        sepLine(),
-        "",
-        binanceSpotKvLine,
+        ...polyBlock,
         "",
         sepLine(),
         "",
@@ -747,20 +1022,7 @@ async function main() {
       prevSpotPrice = spotPrice ?? prevSpotPrice;
       prevCurrentPrice = currentPrice ?? prevCurrentPrice;
 
-      appendCsvRow("./logs/signals.csv", header, [
-        new Date().toISOString(),
-        timing.elapsedMinutes.toFixed(3),
-        timeLeftMin.toFixed(3),
-        regimeInfo.regime,
-        signal,
-        timeAware.adjustedUp,
-        timeAware.adjustedDown,
-        marketUp,
-        marketDown,
-        edge.edgeUp,
-        edge.edgeDown,
-        rec.action === "ENTER" ? `${rec.side}:${rec.phase}:${rec.strength}` : "NO_TRADE"
-      ]);
+      // CSV será gravado apenas no fechamento do candle (com resultado final)
     } catch (err) {
       console.log("────────────────────────────");
       console.log(`Error: ${err?.message ?? String(err)}`);

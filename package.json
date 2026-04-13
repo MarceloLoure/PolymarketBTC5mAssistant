@@ -7,6 +7,7 @@
     "start": "node src/index.js"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
     "ethers": "^6.11.1",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",

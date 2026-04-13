@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { CONFIG } from "./config.js";
 import { fetchKlines, fetchLastPrice } from "./data/binance.js";
 import { fetchChainlinkBtcUsd } from "./data/chainlink.js";
@@ -563,11 +564,48 @@ async function main() {
       const vwapValue = `${formatNumber(vwapNow, 0)} (${formatPct(vwapDist, 2)}) | slope: ${vwapSlopeLabel}`;
       const vwapLine = formatNarrativeValue("VWAP", vwapValue, vwapNarrative);
 
+      const indicatorSignals = [
+        { name: "heiken", narrative: haNarrative, weight: 1.0 },
+        { name: "rsi", narrative: rsiNarrative, weight: 1.0 },
+        { name: "macd", narrative: macdNarrative, weight: 1.0 },
+        { name: "vwap", narrative: vwapNarrative, weight: 1.0 },
+        { name: "delta1", narrative: delta1Narrative, weight: 0.5 },
+        { name: "delta3", narrative: delta3Narrative, weight: 0.5 }
+      ];
+
+      let indicatorScore = 0;
+      let indicatorWeight = 0;
+      for (const s of indicatorSignals) {
+        const v = s.narrative === "LONG" ? 1 : s.narrative === "SHORT" ? -1 : 0;
+        indicatorScore += v * s.weight;
+        indicatorWeight += s.weight;
+      }
+
+      const modelScore = (pLong !== null && pShort !== null && Number.isFinite(pLong) && Number.isFinite(pShort))
+        ? (pLong - pShort)
+        : 0;
+
+      const combinedScoreRaw = (modelScore * 2) + (indicatorWeight ? (indicatorScore / indicatorWeight) : 0);
+      const combinedScore = Math.max(-1, Math.min(1, combinedScoreRaw));
+      const biasNarrative = combinedScore > 0.15 ? "LONG" : combinedScore < -0.15 ? "SHORT" : "NEUTRAL";
+      const biasText = biasNarrative === "LONG"
+        ? `${ANSI.green}LONG${ANSI.reset}`
+        : biasNarrative === "SHORT"
+          ? `${ANSI.red}SHORT${ANSI.reset}`
+          : `${ANSI.gray}NEUTRAL${ANSI.reset}`;
+      const biasScoreText = `${combinedScore >= 0 ? "+" : ""}${combinedScore.toFixed(2)}`;
+      const biasLine = `${biasText} (${biasScoreText})`;
+
       const signal = rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE";
 
       const actionLine = rec.action === "ENTER"
         ? `${rec.action} NOW (${rec.phase} ENTRY)`
         : `NO TRADE (${rec.phase})`;
+      const recommendationText = rec.action === "ENTER"
+        ? (rec.side === "UP"
+          ? `${ANSI.green}COMPRAR (UP)${ANSI.reset}`
+          : `${ANSI.red}VENDER (DOWN)${ANSI.reset}`)
+        : `${ANSI.gray}SEM TRADE${ANSI.reset}`;
 
       const spreadUp = poly.ok ? poly.orderbook.up.spread : null;
       const spreadDown = poly.ok ? poly.orderbook.down.spread : null;
@@ -646,7 +684,7 @@ async function main() {
       const binanceSpotKvLine = kv("BTC (Binance):", binanceSpotValue);
 
       const titleLine = poly.ok ? `${poly.market?.question ?? "-"}` : "-";
-      const marketLine = kv("Market:", poly.ok ? (poly.market?.slug ?? "-") : "-");
+      const marketLine = kv("Mercado:", poly.ok ? (poly.market?.slug ?? "-") : "-");
 
       const timeColor = timeLeftMin >= 10 && timeLeftMin <= 15
         ? ANSI.green
@@ -655,7 +693,7 @@ async function main() {
           : timeLeftMin >= 0 && timeLeftMin < 5
             ? ANSI.red
             : ANSI.reset;
-      const timeLeftLine = `⏱ Time left: ${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`;
+      const timeLeftLine = `⏱ Tempo restante: ${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`;
 
       const polyTimeLeftColor = settlementLeftMin !== null
         ? (settlementLeftMin >= 10 && settlementLeftMin <= 15
@@ -670,23 +708,26 @@ async function main() {
       const lines = [
         titleLine,
         marketLine,
-        kv("Time left:", `${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`),
+        kv("Tempo restante:", `${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`),
         "",
         sepLine(),
         "",
-        kv("TA Predict:", predictValue),
+        kv("TA Prev:", predictValue),
+        kv("Vies (Modelo+Ind):", biasLine),
         kv("Heiken Ashi:", heikenLine.split(": ")[1] ?? heikenLine),
         kv("RSI:", rsiLine.split(": ")[1] ?? rsiLine),
         kv("MACD:", macdLine.split(": ")[1] ?? macdLine),
         kv("Delta 1/3:", deltaLine.split(": ")[1] ?? deltaLine),
         kv("VWAP:", vwapLine.split(": ")[1] ?? vwapLine),
+        rec.action === "NO_TRADE" && rec.reason ? kv("Motivo Sem Trade:", String(rec.reason)) : null,
         "",
         sepLine(),
         "",
         kv("POLYMARKET:", polyHeaderValue),
-        liquidity !== null ? kv("Liquidity:", formatNumber(liquidity, 0)) : null,
-        settlementLeftMin !== null ? kv("Time left:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
-        priceToBeat !== null ? kv("PRICE TO BEAT: ", `$${formatNumber(priceToBeat, 0)}`) : kv("PRICE TO BEAT: ", `${ANSI.gray}-${ANSI.reset}`),
+        kv("Recomendacao:", recommendationText),
+        liquidity !== null ? kv("Liquidez:", formatNumber(liquidity, 0)) : null,
+        settlementLeftMin !== null ? kv("Tempo restante:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
+        priceToBeat !== null ? kv("PRECO A SUPERAR:", `$${formatNumber(priceToBeat, 0)}`) : kv("PRECO A SUPERAR:", `${ANSI.gray}-${ANSI.reset}`),
         currentPriceLine,
         "",
         sepLine(),
@@ -695,10 +736,10 @@ async function main() {
         "",
         sepLine(),
         "",
-        kv("ET | Session:", `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`),
+        kv("ET | Sessao:", `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`),
         "",
         sepLine(),
-        centerText(`${ANSI.dim}${ANSI.gray}created by @krajekis${ANSI.reset}`, screenWidth())
+        centerText(`${ANSI.dim}${ANSI.gray}criado por @krajekis${ANSI.reset}`, screenWidth())
       ].filter((x) => x !== null);
 
       renderScreen(lines.join("\n") + "\n");

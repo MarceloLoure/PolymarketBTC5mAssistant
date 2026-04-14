@@ -4,7 +4,8 @@ import { fetchKlines, fetchLastPrice } from "./data/binance.js";
 import { fetchChainlinkBtcUsd } from "./data/chainlink.js";
 import { startChainlinkPriceStream } from "./data/chainlinkWs.js";
 import { startPolymarketChainlinkPriceStream } from "./data/polymarketLiveWs.js";
-import { polymarketDecisionEngine } from "./engines/polymarketSkill.js";
+import { initPolymarket, executeOrder } from "./trading/polymarketExecutor.js";
+import { buildSmartAdvisor, polymarketPropEngine } from "./engines/polymarketSkill.js";
 import {
   fetchMarketBySlug,
   fetchLiveEventsBySeriesId,
@@ -34,6 +35,7 @@ import { learningState } from "./engines/learningState.js";
 
 const CANDLE_CACHE_FILE_5M = "./logs/klines_5m.json";
 const CANDLE_CACHE_LIMIT_5M = 100;
+let tradedThisCandle = false;
 
 function loadLocalKlines(filePath) {
   try {
@@ -504,6 +506,19 @@ async function main() {
     "final_result"
   ];
 
+  const tradeTableHeader = [
+    "timestamp",
+    "side",
+    "entry_price",
+    "strike",
+    "final_price",
+    "result"
+  ];
+
+  // Garantir que o cliente Polymarket está inicializado antes de começar a processar dados
+  await initPolymarket();
+
+
   while (true) {
     const timing = getCandleWindowTiming(CONFIG.candleWindowMinutes);
 
@@ -627,17 +642,18 @@ async function main() {
       //   regime:           regimeInfo.regime    // NOVO
       // });
 
-      const rec = polymarketDecisionEngine({
+      const rec = polymarketPropEngine({
         timeLeftMin,
         score: scored.score,
         bullCount: scored.bullCount,
         bearCount: scored.bearCount,
         marketUp,
         marketDown,
-        modelUp: timeAware.adjustedUp,
-        modelDown: timeAware.adjustedDown,
+        modelUp: timeAware.adjustedUp,   // ✔ obrigatório
+        modelDown: timeAware.adjustedDown, // ✔ obrigatório
         currentPrice,
-        priceToBeat: priceToBeatState.value
+        priceToBeat: priceToBeatState.value,
+        rsi: rsiNow
       });
 
       const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
@@ -776,6 +792,7 @@ async function main() {
         });
         tradeJournal.maybeSuggestParams();
         lastEntry = null;
+        tradedThisCandle = false;
 
         const pendings = pendingSignals.get(timing.endMs);
 
@@ -805,6 +822,18 @@ async function main() {
               pending.edge_up,
               pending.edge_down,
               pending.recommendation,
+              btcClose ?? "",
+              result
+            ]);
+
+            // =============================
+            // 📊 NOVA TABELA LIMPA (CANDLE RESULT)
+            // =============================
+            appendCsvRow("./logs/trade_results.csv", tradeTableHeader, [
+              pending.timestamp,
+              pending.side,
+              pending.entry_price ?? "",
+              pending.strikeAtOpen ?? "",
               btcClose ?? "",
               result
             ]);
@@ -918,59 +947,274 @@ async function main() {
         spread
       });
       
-      const advisorLine = formatAdvisorLine(advisor, ANSI);
+      // const advisorLine = formatAdvisorLine(advisor, ANSI);
 
-      if (rec.action === "ENTER") {
-        if (lastEntryWindowEndMs === timing.endMs) {
-          
-          console.log(`[RE-ENTRY] ${new Date().toISOString()} side=${rec.side} price=${currentPrice ?? spotPrice} phase=${rec.phase} edge=${rec.edge ?? "-"} score=${scored.score} window=${formatWindowLabel(timing.startMs, timing.endMs)} market=${marketSlug || "-"}`);
-        } else {
-        const entryPrice = rec.side === "UP"
-          ? (poly.ok ? poly.prices.up : null)
-          : (poly.ok ? poly.prices.down : null);
-        const safeEntryPrice = Number.isFinite(entryPrice) ? entryPrice : (currentPrice ?? spotPrice);
-        const modelProb = rec.side === "UP" ? timeAware.adjustedUp : timeAware.adjustedDown;
-        const signals = rec.side === "UP" ? scored.bullCount : scored.bearCount;
-        console.log(`[ENTRY] ${new Date().toISOString()} side=${rec.side} price=${safeEntryPrice} phase=${rec.phase} edge=${rec.edge ?? "-"} score=${scored.score} window=${formatWindowLabel(timing.startMs, timing.endMs)} market=${marketSlug || "-"}`);
-        lastEntry = { side: rec.side, entryPrice: safeEntryPrice };
-        lastEntryWindowEndMs = timing.endMs;
-        tradeJournal.openEntry({
-          windowStartMs: timing.startMs,
-          windowEndMs: timing.endMs,
-          entryPrice: safeEntryPrice,
-          strikeAtOpen: priceToBeatState.value,
-          side: rec.side,
-          edge: rec.edge ?? null,
-          modelProb,
+      const advisorLine = buildSmartAdvisor(
+        rec,
+        {
+          edge: rec.edge ?? edge.edgeUp ?? edge.edgeDown ?? null,
           score: scored.score,
-          signals,
-          phase: rec.phase,
-          marketSlug
+          timeLeftMin
+        },
+        ANSI
+      );
+
+      const MIN_EDGE = 0.05;
+      const MIN_SCORE = 0.5;
+      const MAX_SPREAD = 5;
+
+      // 🔐 controle de risco
+      const BANKROLL = 100;        // total (ajusta depois)
+      const RISK_PER_TRADE = 0.02; // 2%
+
+      // 🧪 modo seguro
+      const PAPER_MODE = true;
+
+      // ⏱ cooldown
+      const COOLDOWN = 60 * 1000;
+      if (!global.lastTradeTs) global.lastTradeTs = 0;
+
+      // edge real (fallback inteligente)
+      const effectiveEdge =
+        rec.edge ??
+        (rec.side === "UP" ? edge.edgeUp : edge.edgeDown) ??
+        0;
+
+        const canTrade =rec.action === "ENTER" && !tradedThisCandle && Date.now() - lastTradeTs > COOLDOWN
+
+        // const canTrade =
+        //   !tradedThisCandle &&
+        //   rec.action === "ENTER" &&
+        //   effectiveEdge > MIN_EDGE &&
+        //   scored.score > MIN_SCORE &&
+        //   spread < MAX_SPREAD &&
+        //   Date.now() - global.lastTradeTs > COOLDOWN &&
+        //   poly.ok &&
+        //   poly.tokens?.upTokenId &&
+        //   poly.tokens?.downTokenId;
+
+  // 🚫 se não pode, nem entra
+  if (canTrade) {
+
+    const tokenId = rec.side === "UP"
+      ? poly.tokens.upTokenId
+      : poly.tokens.downTokenId;
+
+    const marketPrice = rec.side === "UP"
+      ? poly.prices.up
+      : poly.prices.down;
+
+    // 🧠 proteção: evita preço inválido
+    if (!Number.isFinite(marketPrice)) {
+      console.log("⚠️ preço inválido, pulando trade");
+      continue;
+    }
+
+    // 💰 stake dinâmica
+    const baseSize = BANKROLL * RISK_PER_TRADE;
+    const edgeMultiplier = Math.min(1, effectiveEdge * 10); // escala com edge
+    const size = Math.min(1, baseSize * edgeMultiplier);
+
+    // 🎯 melhoria: tenta pegar preço melhor (limit)
+    const priceImprovement = 0.01;
+    const limitPrice = Math.max(0.01, marketPrice - priceImprovement);
+
+    try {
+      if (PAPER_MODE) {
+        console.log("🧪 PAPER TRADE:", {
+          side: rec.side,
+          tokenId,
+          marketPrice,
+          limitPrice,
+          size,
+          edge: effectiveEdge.toFixed(3),
+          score: scored.score.toFixed(2)
         });
 
-        if (!pendingSignals.has(timing.endMs)) {
-          pendingSignals.set(timing.endMs, []);
+        tradedThisCandle = true; // marca que trade foi feito nesse candle (mesmo que seja simulado)
+      } else {
+        const order = await executeOrder({
+          tokenId,
+          price: limitPrice,
+          size,
+          side: "BUY"
+        });
+
+        console.log("🚀 Executando ordem:", order);
+
+        if (!order.success) {
+          console.log("❌ Ordem falhou:", order.errorMsg);
+          return;
         }
 
-        pendingSignals.get(timing.endMs).push({
-          timestamp: new Date().toISOString(),
-          entry_minute: Number.isFinite(timing.elapsedMinutes) ? timing.elapsedMinutes.toFixed(3) : "",
-          time_left_min: Number.isFinite(timeLeftMin) ? timeLeftMin.toFixed(3) : "",
-          regime: regimeInfo.regime,
-          signal,
-          model_up: timeAware.adjustedUp,
-          model_down: timeAware.adjustedDown,
-          mkt_up: marketUp,
-          mkt_down: marketDown,
-          edge_up: edge.edgeUp,
-          edge_down: edge.edgeDown,
-          recommendation: `${rec.side}:${rec.phase}:${rec.strength}`,
-          side: rec.side,
-          strikeAtOpen: priceToBeatState.value,
-          edge: rec.edge
-        });
+        if (order.status !== "matched") {
+          console.log("⚠️ Ordem não executada imediatamente:", order.status);
+        } else {
+          console.log("✅ Ordem executada (MATCHED)");
         }
       }
+
+      global.lastTradeTs = Date.now();
+
+    } catch (err) {
+      console.log("❌ ERRO AO EXECUTAR:", err.message);
+      return;
+    }
+
+    // =============================
+    // 📊 LOG + JOURNAL (mantido)
+    // =============================
+
+    if (lastEntryWindowEndMs === timing.endMs) {
+      console.log(`[RE-ENTRY] ${new Date().toISOString()} side=${rec.side} price=${currentPrice ?? spotPrice} phase=${rec.phase} edge=${effectiveEdge} score=${scored.score} window=${formatWindowLabel(timing.startMs, timing.endMs)} market=${marketSlug || "-"}`);
+    } else {
+
+      const entryPrice = rec.side === "UP"
+        ? (poly.ok ? poly.prices.up : null)
+        : (poly.ok ? poly.prices.down : null);
+
+      const safeEntryPrice = Number.isFinite(entryPrice)
+        ? entryPrice
+        : (currentPrice ?? spotPrice);
+
+      const modelProb = rec.side === "UP"
+        ? timeAware.adjustedUp
+        : timeAware.adjustedDown;
+
+      const signals = rec.side === "UP"
+        ? scored.bullCount
+        : scored.bearCount;
+
+      console.log(`[ENTRY] ${new Date().toISOString()} side=${rec.side} price=${safeEntryPrice} phase=${rec.phase} edge=${effectiveEdge} score=${scored.score} window=${formatWindowLabel(timing.startMs, timing.endMs)} market=${marketSlug || "-"}`);
+
+      lastEntry = {
+        tokenId,
+        side: rec.side,
+        entryPrice: safeEntryPrice,
+        size, // 👈 importante pra sair depois
+      };
+      lastEntryWindowEndMs = timing.endMs;
+
+      tradeJournal.openEntry({
+        windowStartMs: timing.startMs,
+        windowEndMs: timing.endMs,
+        entryPrice: safeEntryPrice,
+        strikeAtOpen: priceToBeatState.value,
+        side: rec.side,
+        edge: effectiveEdge,
+        modelProb,
+        score: scored.score,
+        signals,
+        phase: rec.phase,
+        marketSlug
+      });
+
+      if (!pendingSignals.has(timing.endMs)) {
+        pendingSignals.set(timing.endMs, []);
+      }
+
+      pendingSignals.get(timing.endMs).push({
+        timestamp: new Date().toISOString(),
+        entry_minute: Number.isFinite(timing.elapsedMinutes) ? timing.elapsedMinutes.toFixed(3) : "",
+        time_left_min: Number.isFinite(timeLeftMin) ? timeLeftMin.toFixed(3) : "",
+        regime: regimeInfo.regime,
+        signal,
+        model_up: timeAware.adjustedUp,
+        model_down: timeAware.adjustedDown,
+        mkt_up: marketUp,
+        mkt_down: marketDown,
+        edge_up: edge.edgeUp,
+        edge_down: edge.edgeDown,
+        recommendation: `${rec.side}:${rec.phase}:${rec.strength}`,
+        side: rec.side,
+        strikeAtOpen: priceToBeatState.value,
+        edge: effectiveEdge,
+        entry_price: safeEntryPrice,
+      });
+    }
+  }
+
+      // if (
+      //   rec.action === "ENTER" &&
+      //   (rec.edge ?? 0) > MIN_EDGE &&
+      //   scored.score > MIN_SCORE &&
+      //   spread < 5 // evita mercado ruim
+      // ) {
+
+      //   const tokenId = rec.side === "UP"
+      //   ? poly.tokens.upTokenId
+      //   : poly.tokens.downTokenId;
+
+      // const marketPrice = rec.side === "UP"
+      //   ? poly.prices.up
+      //   : poly.prices.down;
+
+      // const size = 1; // 👈 define stake (USDC)
+
+      // try {
+      //   const order = await executeOrder({
+      //     tokenId,
+      //     price: marketPrice,
+      //     size,
+      //     side: "BUY"
+      //   });
+
+      //   console.log("🚀 ORDEM EXECUTADA:", order);
+      // } catch (err) {
+      //   console.log("❌ ERRO AO EXECUTAR:", err.message);
+      // }
+
+      //   // Verificar se é re-entrada no mesmo período
+      //   if (lastEntryWindowEndMs === timing.endMs) {
+          
+      //     console.log(`[RE-ENTRY] ${new Date().toISOString()} side=${rec.side} price=${currentPrice ?? spotPrice} phase=${rec.phase} edge=${rec.edge ?? "-"} score=${scored.score} window=${formatWindowLabel(timing.startMs, timing.endMs)} market=${marketSlug || "-"}`);
+      //   } else {
+      //   const entryPrice = rec.side === "UP"
+      //     ? (poly.ok ? poly.prices.up : null)
+      //     : (poly.ok ? poly.prices.down : null);
+      //   const safeEntryPrice = Number.isFinite(entryPrice) ? entryPrice : (currentPrice ?? spotPrice);
+      //   const modelProb = rec.side === "UP" ? timeAware.adjustedUp : timeAware.adjustedDown;
+      //   const signals = rec.side === "UP" ? scored.bullCount : scored.bearCount;
+      //   console.log(`[ENTRY] ${new Date().toISOString()} side=${rec.side} price=${safeEntryPrice} phase=${rec.phase} edge=${rec.edge ?? "-"} score=${scored.score} window=${formatWindowLabel(timing.startMs, timing.endMs)} market=${marketSlug || "-"}`);
+      //   lastEntry = { side: rec.side, entryPrice: safeEntryPrice };
+      //   lastEntryWindowEndMs = timing.endMs;
+      //   tradeJournal.openEntry({
+      //     windowStartMs: timing.startMs,
+      //     windowEndMs: timing.endMs,
+      //     entryPrice: safeEntryPrice,
+      //     strikeAtOpen: priceToBeatState.value,
+      //     side: rec.side,
+      //     edge: rec.edge ?? null,
+      //     modelProb,
+      //     score: scored.score,
+      //     signals,
+      //     phase: rec.phase,
+      //     marketSlug
+      //   });
+
+      //   if (!pendingSignals.has(timing.endMs)) {
+      //     pendingSignals.set(timing.endMs, []);
+      //   }
+
+      //   pendingSignals.get(timing.endMs).push({
+      //     timestamp: new Date().toISOString(),
+      //     entry_minute: Number.isFinite(timing.elapsedMinutes) ? timing.elapsedMinutes.toFixed(3) : "",
+      //     time_left_min: Number.isFinite(timeLeftMin) ? timeLeftMin.toFixed(3) : "",
+      //     regime: regimeInfo.regime,
+      //     signal,
+      //     model_up: timeAware.adjustedUp,
+      //     model_down: timeAware.adjustedDown,
+      //     mkt_up: marketUp,
+      //     mkt_down: marketDown,
+      //     edge_up: edge.edgeUp,
+      //     edge_down: edge.edgeDown,
+      //     recommendation: `${rec.side}:${rec.phase}:${rec.strength}`,
+      //     side: rec.side,
+      //     strikeAtOpen: priceToBeatState.value,
+      //     edge: rec.edge
+      //   });
+      //   }
+      // }
 
       const binanceSpotBaseLine = colorPriceLine({ label: "BTC (Binance)", price: spotPrice, prevPrice: prevSpotPrice, decimals: 0, prefix: "$" });
       const diffLine = (spotPrice !== null && currentPrice !== null && Number.isFinite(spotPrice) && Number.isFinite(currentPrice) && currentPrice !== 0)
@@ -1022,16 +1266,82 @@ async function main() {
               : ANSI.reset)
         : ANSI.reset;
 
+      // const walletLine = balance
+      // ? kv(
+      //     "Carteira:",
+      //     `${ANSI.green}$${formatNumber(balance.available, 2)}${ANSI.reset} (disp) | ${ANSI.white}$${formatNumber(balance.total, 2)}${ANSI.reset} (total)`
+      //   )
+      // : kv("Carteira:", `${ANSI.gray}-${ANSI.reset}`);
+
       const polyBlock = [
         kv("POLYMARKET:", polyHeaderValue),
+        // walletLine,
         kv("Recomendacao:", recommendationText),
         liveEntryStatus ? kv("Status Trade:", liveEntryStatus) : null,
         kv("Advisor:", advisorLine),
+        // kv("Sinal para entrar:", actionLine),
+        kv("Spread:", spread !== null ? `${formatNumber(spread, 0)}¢` : "-"),
         liquidity !== null ? kv("Liquidez:", formatNumber(liquidity, 0)) : null,
         settlementLeftMin !== null ? kv("Tempo restante:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
         priceToBeat !== null ? kv("PRECO A SUPERAR:", `$${formatNumber(priceToBeat, 0)}`) : kv("PRECO A SUPERAR:", `${ANSI.gray}-${ANSI.reset}`),
         currentPriceLine
       ].filter((x) => x !== null);
+
+      let entryBlock = [];
+
+      if (lastEntry && poly.ok) {
+        const exit = await checkAutoExit({ lastEntry, poly });
+
+        if (exit) {
+          const btcClose = currentPrice;
+
+          await finalizeTrade(
+            {
+              timestamp: new Date().toISOString(),
+              side: lastEntry.side,
+              entry_price: lastEntry.entryPrice,
+              strikeAtOpen: lastEntry.strikeAtOpen
+            },
+            btcClose
+          );
+        }
+      }
+
+      if (lastEntry) {
+        entryBlock = [
+          sepLine(),
+          "",
+          kv("📊 TRADE ATIVO:", ""),
+          kv("Token:", lastEntry.tokenId || "-"),
+          kv("Side:", lastEntry.side === "UP"
+            ? `${ANSI.green}UP${ANSI.reset}`
+            : `${ANSI.red}DOWN${ANSI.reset}`),
+          kv("Preço Entrada:", `$${formatNumber(lastEntry.entryPrice, 2)}`),
+          kv("Preço Atual:", currentPrice !== null
+            ? `$${formatNumber(currentPrice, 2)}`
+            : "-"),
+          kv("P/L:", (() => {
+            if (!Number.isFinite(lastEntry.entryPrice) || !Number.isFinite(currentPrice)) {
+              return `${ANSI.gray}-${ANSI.reset}`;
+            }
+
+            const pnl = currentPrice - lastEntry.entryPrice;
+            const pct = (pnl / lastEntry.entryPrice) * 100;
+
+            const isWin = lastEntry.side === "UP"
+              ? pnl > 0
+              : pnl < 0;
+
+            const color = isWin ? ANSI.green : ANSI.red;
+
+            return `${color}${pnl > 0 ? "+" : ""}$${pnl.toFixed(2)} (${pct.toFixed(2)}%)${ANSI.reset}`;
+          })()),
+          kv("Edge:", effectiveEdge !== null ? effectiveEdge.toFixed(3) : "-"),
+          kv("Score:", scored.score.toFixed(2)),
+          kv("Tempo restante:", `${fmtTimeLeft(timeLeftMin)}`),
+          ""
+        ];
+      }
 
       const lines = [
         titleLine,
@@ -1060,10 +1370,11 @@ async function main() {
         "",
         sepLine(),
         "",
+        ...entryBlock,
         kv("ET | Sessao:", `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`),
         "",
         sepLine(),
-        centerText(`${ANSI.dim}${ANSI.gray}criado por @krajekis${ANSI.reset}`, screenWidth())
+        centerText(`${ANSI.dim}${ANSI.gray}criado por @krajekis e otimizado por @pangzinn${ANSI.reset}`, screenWidth())
       ].filter((x) => x !== null);
 
       renderScreen(lines.join("\n") + "\n");
@@ -1081,6 +1392,80 @@ async function main() {
     }
 
     await sleep(CONFIG.pollIntervalMs);
+  }
+
+  async function checkAutoExit({ lastEntry, poly }) {
+    if (!lastEntry) return;
+
+    const currentPrice = lastEntry.side === "UP"
+      ? poly.prices.up
+      : poly.prices.down;
+
+    if (!Number.isFinite(currentPrice)) return;
+
+    const entry = lastEntry.entryPrice;
+
+    const pnlPct = (currentPrice - entry) / entry;
+
+    // 🧠 ajuste para DOWN
+    const adjustedPnl = lastEntry.side === "UP"
+      ? pnlPct
+      : -pnlPct;
+
+    // 🎯 TAKE PROFIT
+    if (adjustedPnl >= 0.25) {
+      console.log("💰 TAKE PROFIT atingido!", adjustedPnl);
+      const exitPrice = Math.max(0.01, currentPrice - 0.01);
+
+      await executeOrder({
+        tokenId: lastEntry.tokenId,
+        price: exitPrice,
+        size: lastEntry.size,
+        side: "SELL"
+      });
+
+      return "EXIT_TP";
+    }
+
+    // 🛑 STOP LOSS (opcional)
+    if (adjustedPnl <= -0.15) {
+      console.log("🛑 STOP LOSS!", adjustedPnl);
+
+      await executeOrder({
+        tokenId: lastEntry.tokenId,
+        price: currentPrice,
+        size: lastEntry.size,
+        side: "SELL"
+      });
+
+      return "EXIT_SL";
+    }
+
+    return null;
+  }
+
+  async function finalizeTrade(pending, btcClose) {
+    const strike = pending.strikeAtOpen;
+
+    let result = "";
+
+    if (Number.isFinite(btcClose) && strike !== null) {
+      result =
+        pending.side === "UP"
+          ? (btcClose > strike ? "GANHO" : "PERDA")
+          : (btcClose < strike ? "GANHO" : "PERDA");
+    }
+
+    appendCsvRow("./logs/trade_results.csv", tradeTableHeader, [
+      pending.timestamp,
+      pending.side,
+      pending.entry_price ?? "",
+      pending.strikeAtOpen ?? "",
+      btcClose ?? "",
+      result
+    ]);
+
+    return result;
   }
 }
 

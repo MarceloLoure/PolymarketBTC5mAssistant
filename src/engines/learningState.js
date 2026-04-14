@@ -4,7 +4,7 @@ export const learningState = {
     EARLY: 30,
     MID: 50,
     LATE: 80,
-    FINAL: 120
+    FINAL: 30
   },
   scoreMin: {
     EARLY: 0.20,

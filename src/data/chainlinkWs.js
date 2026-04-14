@@ -3,7 +3,7 @@ import { ethers } from "ethers";
 import { CONFIG } from "../config.js";
 import { wsAgentForUrl } from "../net/proxy.js";
 
-const ANSWER_UPDATED_TOPIC0 = ethers.id("AnswerUpdated(int256,uint256,uint256)");
+const ANSWER_UPDATED_TOPIC0 = ethers.utils.id("AnswerUpdated(int256,uint256,uint256)");
 
 function getWssCandidates() {
   const fromList = Array.isArray(CONFIG.chainlink.polygonWssUrls) ? CONFIG.chainlink.polygonWssUrls : [];

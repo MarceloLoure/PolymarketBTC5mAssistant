@@ -4,6 +4,7 @@ import { fetchKlines, fetchLastPrice } from "./data/binance.js";
 import { fetchChainlinkBtcUsd } from "./data/chainlink.js";
 import { startChainlinkPriceStream } from "./data/chainlinkWs.js";
 import { startPolymarketChainlinkPriceStream } from "./data/polymarketLiveWs.js";
+import { polymarketDecisionEngine } from "./engines/polymarketSkill.js";
 import {
   fetchMarketBySlug,
   fetchLiveEventsBySeriesId,
@@ -28,6 +29,8 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { applyGlobalProxyFromEnv } from "./net/proxy.js";
+import { updateLearning } from "./engines/autoLearning.js";
+import { learningState } from "./engines/learningState.js";
 
 const CANDLE_CACHE_FILE_5M = "./logs/klines_5m.json";
 const CANDLE_CACHE_LIMIT_5M = 100;
@@ -608,17 +611,33 @@ async function main() {
       const marketDown = poly.ok ? poly.prices.down : null;
       const edge = computeEdge({ modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown, marketYes: marketUp, marketNo: marketDown });
 
-      const rec = decide({
-        remainingMinutes: timeLeftMin,
-        edgeUp:           edge.edgeUp,
-        edgeDown:         edge.edgeDown,
-        modelUp:          timeAware.adjustedUp,
-        modelDown:        timeAware.adjustedDown,
-        score:            scored.score,        // NOVO: score de confluência
-        bullCount:        scored.bullCount,    // NOVO
-        bearCount:        scored.bearCount,    // NOVO
-        totalSignals:     scored.totalSignals, // NOVO
-        regime:           regimeInfo.regime    // NOVO
+      const currentPrice = chainlink?.price ?? null;
+
+      // Esse é a SKILL
+      // const rec = decide({
+      //   remainingMinutes: timeLeftMin,
+      //   edgeUp:           edge.edgeUp,
+      //   edgeDown:         edge.edgeDown,
+      //   modelUp:          timeAware.adjustedUp,
+      //   modelDown:        timeAware.adjustedDown,
+      //   score:            scored.score,        // NOVO: score de confluência
+      //   bullCount:        scored.bullCount,    // NOVO
+      //   bearCount:        scored.bearCount,    // NOVO
+      //   totalSignals:     scored.totalSignals, // NOVO
+      //   regime:           regimeInfo.regime    // NOVO
+      // });
+
+      const rec = polymarketDecisionEngine({
+        timeLeftMin,
+        score: scored.score,
+        bullCount: scored.bullCount,
+        bearCount: scored.bearCount,
+        marketUp,
+        marketDown,
+        modelUp: timeAware.adjustedUp,
+        modelDown: timeAware.adjustedDown,
+        currentPrice,
+        priceToBeat: priceToBeatState.value
       });
 
       const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
@@ -707,7 +726,9 @@ async function main() {
           ? `${ANSI.red}VENDER${ANSI.reset}`
           : `${ANSI.gray}NEUTRO${ANSI.reset}`;
 
-      const signal = rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE";
+      const signal = rec.action === "ENTER"
+        ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN")
+        : "NO TRADE";
 
       const actionLine = rec.action === "ENTER"
         ? `${rec.action} NOW (${rec.phase} ENTRY)`
@@ -739,7 +760,7 @@ async function main() {
         : null;
 
       const spotPrice = wsPrice ?? lastPrice;
-      const currentPrice = chainlink?.price ?? null;
+      
       const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
       const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
 
@@ -756,33 +777,55 @@ async function main() {
         tradeJournal.maybeSuggestParams();
         lastEntry = null;
 
-        const pending = pendingSignals.get(timing.startMs);
-        if (pending) {
-          const btcClose = pickClosePrice(candles, timing.startMs) ?? (Number.isFinite(currentPrice) ? currentPrice : spotPrice);
-          const strike = Number.isFinite(pending.strikeAtOpen) ? pending.strikeAtOpen : null;
-          let result = "";
-          if (Number.isFinite(btcClose) && strike !== null) {
-            result = pending.side === "UP"
-              ? (btcClose > strike ? "GANHO" : "PERDA")
-              : (btcClose < strike ? "GANHO" : "PERDA");
+        const pendings = pendingSignals.get(timing.endMs);
+
+        if (pendings && pendings.length) {
+          for (const pending of pendings) {
+            const btcClose = pickClosePrice(candles, timing.startMs) ?? (Number.isFinite(currentPrice) ? currentPrice : spotPrice);
+            const strike = Number.isFinite(pending.strikeAtOpen) ? pending.strikeAtOpen : null;
+
+            let result = "";
+
+            if (Number.isFinite(btcClose) && strike !== null) {
+              result = pending.side === "UP"
+                ? (btcClose > strike ? "GANHO" : "PERDA")
+                : (btcClose < strike ? "GANHO" : "PERDA");
+            }
+
+            appendCsvRow("./logs/signals.csv", header, [
+              pending.timestamp,
+              pending.entry_minute,
+              pending.time_left_min,
+              pending.regime,
+              pending.signal,
+              pending.model_up,
+              pending.model_down,
+              pending.mkt_up,
+              pending.mkt_down,
+              pending.edge_up,
+              pending.edge_down,
+              pending.recommendation,
+              btcClose ?? "",
+              result
+            ]);
+
+            updateLearning({
+              trade: {
+                evExpected: pending.edge ?? 0, // 👈 MELHOR que lastEntry
+                result: result === "GANHO" ? 1 : -1,
+                pnl: result === "GANHO" ? 1 : -1
+              }
+            });
           }
-          appendCsvRow("./logs/signals.csv", header, [
-            pending.timestamp,
-            pending.entry_minute,
-            pending.time_left_min,
-            pending.regime,
-            pending.signal,
-            pending.model_up,
-            pending.model_down,
-            pending.mkt_up,
-            pending.mkt_down,
-            pending.edge_up,
-            pending.edge_down,
-            pending.recommendation,
-            btcClose ?? "",
-            result
-          ]);
-          pendingSignals.delete(timing.startMs);
+
+          pendingSignals.delete(timing.endMs);
+
+          console.log("[AUTO-LEARNING]", {
+            edgeMin: learningState.edgeMin,
+            deltaLate: learningState.deltaMin.LATE,
+            winRate: (learningState.stats.wins / learningState.stats.totalTrades).toFixed(2),
+            pnl: learningState.stats.realPnL
+          });
         }
       }
       lastWindowStartMs = timing.startMs;
@@ -879,7 +922,8 @@ async function main() {
 
       if (rec.action === "ENTER") {
         if (lastEntryWindowEndMs === timing.endMs) {
-          // já entrou neste candle
+          
+          console.log(`[RE-ENTRY] ${new Date().toISOString()} side=${rec.side} price=${currentPrice ?? spotPrice} phase=${rec.phase} edge=${rec.edge ?? "-"} score=${scored.score} window=${formatWindowLabel(timing.startMs, timing.endMs)} market=${marketSlug || "-"}`);
         } else {
         const entryPrice = rec.side === "UP"
           ? (poly.ok ? poly.prices.up : null)
@@ -904,7 +948,11 @@ async function main() {
           marketSlug
         });
 
-        pendingSignals.set(timing.endMs, {
+        if (!pendingSignals.has(timing.endMs)) {
+          pendingSignals.set(timing.endMs, []);
+        }
+
+        pendingSignals.get(timing.endMs).push({
           timestamp: new Date().toISOString(),
           entry_minute: Number.isFinite(timing.elapsedMinutes) ? timing.elapsedMinutes.toFixed(3) : "",
           time_left_min: Number.isFinite(timeLeftMin) ? timeLeftMin.toFixed(3) : "",
@@ -918,7 +966,8 @@ async function main() {
           edge_down: edge.edgeDown,
           recommendation: `${rec.side}:${rec.phase}:${rec.strength}`,
           side: rec.side,
-          strikeAtOpen: priceToBeatState.value
+          strikeAtOpen: priceToBeatState.value,
+          edge: rec.edge
         });
         }
       }
@@ -1021,6 +1070,8 @@ async function main() {
 
       prevSpotPrice = spotPrice ?? prevSpotPrice;
       prevCurrentPrice = currentPrice ?? prevCurrentPrice;
+
+
 
       // CSV será gravado apenas no fechamento do candle (com resultado final)
     } catch (err) {

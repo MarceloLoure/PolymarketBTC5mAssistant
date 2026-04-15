@@ -6,8 +6,6 @@ const chainId = 137;
 
 const wallet = new Wallet(process.env.PRIVATE_KEY); // signer
 
-console.log("Wallet address:", wallet.address);
-
 let client = null;
 
 export async function initPolymarket() {
@@ -31,7 +29,10 @@ export async function initPolymarket() {
 export async function executeOrder({ tokenId, price, size, side }) {
   if (!client) throw new Error("Client não inicializado");
 
+    // 🧮 Polymarket opera com "shares", então precisamos converter o valor em USDC para a quantidade de share
     // 🔥 converte USDC → shares
+    // Exemplo: se queremos gastar $10 em um token que custa $0.50, isso nos daria 20 shares.
+    // Minimo de 5 shares por ordem, então se o valor for muito baixo, ajustamos para 5 shares. Isso ajuda a evitar ordens muito pequenas que podem não ser executadas.
     const MIN_SHARES = 5;
 
     let shares = size / price;

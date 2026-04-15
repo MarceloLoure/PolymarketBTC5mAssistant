@@ -2,7 +2,14 @@ import { learningState } from "./learningState.js";
 
 // engines/polymarketSkill.js
 
-export function polymarketPropEngine(input) {
+function getMarketBoundaries(candles) {
+  if (!candles || candles.length === 0) return { max: Infinity, min: -Infinity };
+  const highs = candles.map(c => c.high);
+  const lows = candles.map(c => c.low);
+  return { max: Math.max(...highs), min: Math.min(...lows) };
+}
+
+export function polymarketPropEngine(input, historicalCandles) {
   const {
     timeLeftMin, score, bullCount, bearCount,
     marketUp, marketDown, modelUp, modelDown,
@@ -10,24 +17,50 @@ export function polymarketPropEngine(input) {
     regime, heikenColor, heikenColor5m
   } = input;
 
+  const boundaries = getMarketBoundaries(historicalCandles);
+
+  if (timeLeftMin <= 0.5 && timeLeftMin > 0.15) {
+      const marketPrice = (currentPrice > priceToBeat ? marketUp : marketDown);
+      if (marketPrice > 0.82 && Math.abs(score) > 0.80) {
+          return { action: "ENTER", side: currentPrice > priceToBeat ? "UP" : "DOWN", phase: "SUPER_SNIPER" };
+      }
+  }
+
   // 1. VALIDAÇÃO E TRAVA DE SEGURANÇA (TIME LOCK)
   if (timeLeftMin == null || !marketUp || !modelUp || !priceToBeat) {
     return { action: "NO_TRADE", reason: "DADOS_INCOMPLETOS" };
   }
   
   // Bloqueia se faltar menos de 42 segundos para evitar slippage e volatilidade final
-  if (timeLeftMin <= 0.7) return { action: "NO_TRADE", reason: "JANELA_MUITO_CURTA" };
+  // if (timeLeftMin <= 0.7) return { action: "NO_TRADE", reason: "JANELA_MUITO_CURTA" };
 
   // 2. FILTRO DE ALINHAMENTO TRIPLO (DIREÇÃO + MOMENTUM)
   const delta = currentPrice - priceToBeat;
   const side = delta > 0 ? "UP" : "DOWN";
 
-  // Só entra se o Lado do trade bater com a cor do Heiken Ashi 1m e 5m (Assertividade Máxima)
-  const isSideAligned = (side === "UP" && heikenColor === "green" && heikenColor5m === "green") ||
-                        (side === "DOWN" && heikenColor === "red" && heikenColor5m === "red");
+  // // Só entra se o Lado do trade bater com a cor do Heiken Ashi 1m e 5m (Assertividade Máxima)
+  // const isSideAligned = (side === "UP" && heikenColor === "green" && heikenColor5m === "green") ||
+  //                       (side === "DOWN" && heikenColor === "red" && heikenColor5m === "red");
+
+  // if (!isSideAligned) {
+  //   return { action: "NO_TRADE", reason: `HA_CONTRA_DIRECAO (${heikenColor}/${heikenColor5m})` };
+  // }
+
+  // Agora exigimos apenas o alinhamento de 1 minuto (heikenColor)
+  // O de 5 minutos (heikenColor5m) vira apenas um bônus no score, não um bloqueio.
+  const isSideAligned = (side === "UP" && heikenColor === "green") ||
+                        (side === "DOWN" && heikenColor === "red");
 
   if (!isSideAligned) {
-    return { action: "NO_TRADE", reason: `HA_CONTRA_DIRECAO (${heikenColor}/${heikenColor5m})` };
+    return { 
+      action: "NO_TRADE", 
+      reason: `HA_1M_CONTRA (${heikenColor.toUpperCase()})`,
+      debug: { currentHA: heikenColor }
+    };
+  }
+
+  if (side === "UP" && currentPrice >= boundaries.max * 0.9999) {
+      return { action: "NO_TRADE", reason: "RESISTENCIA_HISTORICA_DETECTADA" };
   }
 
   // 3. COLCHÃO DE SEGURANÇA COM "TREND BOOST"
@@ -35,7 +68,7 @@ export function polymarketPropEngine(input) {
   const displacementPct = absDelta / priceToBeat;
   
   // Base de distância por fase
-  let minRequired = timeLeftMin > 3 ? 0.0005 : (timeLeftMin > 1.5 ? 0.0008 : 0.0012);
+  let minRequired = timeLeftMin > 3 ? 0.00045 : (timeLeftMin > 1.5 ? 0.0007 : 0.0011);
 
   // REDUÇÃO DE EXIGÊNCIA: Se a tendência é muito forte (score > 0.75), afrouxamos o colchão em 30%
   if (Math.abs(score) > 0.75) {
@@ -49,7 +82,7 @@ export function polymarketPropEngine(input) {
   if (displacementPct < minRequired) {
     return { 
       action: "NO_TRADE", 
-      reason: `ABAIXO_DO_COLCHAO_SEGURANCA (${(displacementPct*100).toFixed(4)}%)`,
+      reason: `ABAIXO_DO_COLCHAO_SEGURANCA (${(displacementPct*100).toFixed(4)}% - Desejado: ${(minRequired*100).toFixed(2)}%) Esperando ${side === "UP" ? "acima de" : "abaixo de"} ${targetPrice.toFixed(2)}`,
       debug: {
         targetPrice: targetPrice.toFixed(2),
         minRequiredPct: (minRequired * 100).toFixed(2) + "%"
@@ -63,7 +96,7 @@ export function polymarketPropEngine(input) {
   const sideCount = side === "UP" ? bullCount : bearCount;
 
   if (sideScore < minScore || sideCount < 4) {
-    return { action: "NO_TRADE", reason: `CONFLUENCIA_INSUFICIENTE (Score: ${sideScore.toFixed(2)})` };
+    return { action: "NO_TRADE", reason: `CONFLUENCIA_INSUFICIENTE (Score: ${sideScore.toFixed(2)} - Desejado: ${minScore.toFixed(2)}) Esperando ${side === "UP" ? "acima de" : "abaixo de"} ${targetPrice.toFixed(2)}` }; 
   }
 
   // 5. EDGE DINÂMICO (FILTRO DE PREÇO JUSTO)
@@ -200,16 +233,21 @@ export function buildSmartAdvisor(rec, ctx, ANSI) {
   // ========================
   // 9. OUTPUT (DESK FORMAT)
   // ========================
+  const safeConf = (confidence || 0).toFixed(1);
+  const safeEdge = (edge || 0).toFixed(3);
+  const safeEv = (ev || 0).toFixed(3);
+  const safeScore = (rec.score || rec.scoreFinal || 0).toFixed(3); // Aceita os dois nomes
+
   return [
     `${sideColor}${side}${ANSI.reset}`,
     `${ratingColor}${rating}${ANSI.reset}`,
     `${setupColor}${setup}${ANSI.reset}`,
     `${riskColor}${riskQuality}${ANSI.reset}`,
     `${urgencyColor}${urgency}${ANSI.reset}`,
-    `conf ${confidence.toFixed(1)}%`,
-    `edge ${edge.toFixed(3)}`,
-    `ev ${ev.toFixed(3)}`,
-    `score ${(scoreFinal ?? 0).toFixed(3)}`
+    `conf ${safeConf}%`,
+    `edge ${safeEdge}`,
+    `ev ${safeEv}`,
+    `score ${safeScore}`
   ].join(" | ");
 }
 

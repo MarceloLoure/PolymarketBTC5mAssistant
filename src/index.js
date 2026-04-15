@@ -33,9 +33,25 @@ import { applyGlobalProxyFromEnv } from "./net/proxy.js";
 import { updateLearning } from "./engines/autoLearning.js";
 import { learningState } from "./engines/learningState.js";
 
+function getFreshCandles() {
+  try {
+    // Caminho absoluto para evitar erros de diretório
+    const filePath = path.resolve('./logs/klines_5m.json');
+    const data = fs.readFileSync(filePath, 'utf8');
+    return JSON.parse(data);
+  } catch (err) {
+    console.error("❌ Erro ao ler klines_5m.json:", err.message);
+    return [];
+  }
+}
+
+// No seu loop principal:
+const candles = getFreshCandles();
+
 const CANDLE_CACHE_FILE_5M = "./logs/klines_5m.json";
 const CANDLE_CACHE_LIMIT_5M = 100;
 let tradedThisCandle = false;
+let orderStatus = null; // Armazena o status da execução atual
 
 function loadLocalKlines(filePath) {
   try {
@@ -659,7 +675,9 @@ async function main() {
         regime: regimeInfo.regime, 
         heikenColor: consec.color,    // Cor do HA 1m
         heikenColor5m: consec5m.color // Cor do HA 5m
-      });
+      },
+      candles
+      );
 
       const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
 
@@ -1018,6 +1036,9 @@ async function main() {
 
         tradedThisCandle = true; // marca que trade foi feito nesse candle (mesmo que seja simulado)
       } else {
+        // 1. Sinaliza o início
+        orderStatus = `${ANSI.yellow}📡 ENVIANDO ORDEM...${ANSI.reset}`;
+        
         const order = await executeOrder({
           tokenId,
           price: limitPrice,
@@ -1025,24 +1046,25 @@ async function main() {
           side: "BUY"
         });
 
-        console.log("🚀 Executando ordem:", order);
-
+        // 2. Atualiza conforme o resultado
         if (!order.success) {
-          console.log("❌ Ordem falhou:", order.errorMsg);
-          return;
+          orderStatus = `${ANSI.red}❌ FALHOU: ${order.errorMsg}${ANSI.reset}`;
+        } else if (order.status !== "matched") {
+          orderStatus = `${ANSI.yellow}⏳ ABERTA (WAITING MATCH)${ANSI.reset}`;
+        } else {
+          orderStatus = `${ANSI.green}✅ MATCHED (SUCESSO)${ANSI.reset}`;
         }
 
-        if (order.status !== "matched") {
-          console.log("⚠️ Ordem não executada imediatamente:", order.status);
-        } else {
-          console.log("✅ Ordem executada (MATCHED)");
-        }
+        console.log("🚀 Ordem Processada:", order);
       }
 
       global.lastTradeTs = Date.now();
 
+      setTimeout(() => { orderStatus = null; }, 10000);
+
     } catch (err) {
-      console.log("❌ ERRO AO EXECUTAR:", err.message);
+      orderStatus = `${ANSI.red}❌ ERRO CRÍTICO NA API${ANSI.reset}`;
+      setTimeout(() => { orderStatus = null; }, 10000);
       return;
     }
 
@@ -1111,88 +1133,6 @@ async function main() {
     }
   }
 
-      // if (
-      //   rec.action === "ENTER" &&
-      //   (rec.edge ?? 0) > MIN_EDGE &&
-      //   scored.score > MIN_SCORE &&
-      //   spread < 5 // evita mercado ruim
-      // ) {
-
-      //   const tokenId = rec.side === "UP"
-      //   ? poly.tokens.upTokenId
-      //   : poly.tokens.downTokenId;
-
-      // const marketPrice = rec.side === "UP"
-      //   ? poly.prices.up
-      //   : poly.prices.down;
-
-      // const size = 1; // 👈 define stake (USDC)
-
-      // try {
-      //   const order = await executeOrder({
-      //     tokenId,
-      //     price: marketPrice,
-      //     size,
-      //     side: "BUY"
-      //   });
-
-      //   console.log("🚀 ORDEM EXECUTADA:", order);
-      // } catch (err) {
-      //   console.log("❌ ERRO AO EXECUTAR:", err.message);
-      // }
-
-      //   // Verificar se é re-entrada no mesmo período
-      //   if (lastEntryWindowEndMs === timing.endMs) {
-          
-      //     console.log(`[RE-ENTRY] ${new Date().toISOString()} side=${rec.side} price=${currentPrice ?? spotPrice} phase=${rec.phase} edge=${rec.edge ?? "-"} score=${scored.score} window=${formatWindowLabel(timing.startMs, timing.endMs)} market=${marketSlug || "-"}`);
-      //   } else {
-      //   const entryPrice = rec.side === "UP"
-      //     ? (poly.ok ? poly.prices.up : null)
-      //     : (poly.ok ? poly.prices.down : null);
-      //   const safeEntryPrice = Number.isFinite(entryPrice) ? entryPrice : (currentPrice ?? spotPrice);
-      //   const modelProb = rec.side === "UP" ? timeAware.adjustedUp : timeAware.adjustedDown;
-      //   const signals = rec.side === "UP" ? scored.bullCount : scored.bearCount;
-      //   console.log(`[ENTRY] ${new Date().toISOString()} side=${rec.side} price=${safeEntryPrice} phase=${rec.phase} edge=${rec.edge ?? "-"} score=${scored.score} window=${formatWindowLabel(timing.startMs, timing.endMs)} market=${marketSlug || "-"}`);
-      //   lastEntry = { side: rec.side, entryPrice: safeEntryPrice };
-      //   lastEntryWindowEndMs = timing.endMs;
-      //   tradeJournal.openEntry({
-      //     windowStartMs: timing.startMs,
-      //     windowEndMs: timing.endMs,
-      //     entryPrice: safeEntryPrice,
-      //     strikeAtOpen: priceToBeatState.value,
-      //     side: rec.side,
-      //     edge: rec.edge ?? null,
-      //     modelProb,
-      //     score: scored.score,
-      //     signals,
-      //     phase: rec.phase,
-      //     marketSlug
-      //   });
-
-      //   if (!pendingSignals.has(timing.endMs)) {
-      //     pendingSignals.set(timing.endMs, []);
-      //   }
-
-      //   pendingSignals.get(timing.endMs).push({
-      //     timestamp: new Date().toISOString(),
-      //     entry_minute: Number.isFinite(timing.elapsedMinutes) ? timing.elapsedMinutes.toFixed(3) : "",
-      //     time_left_min: Number.isFinite(timeLeftMin) ? timeLeftMin.toFixed(3) : "",
-      //     regime: regimeInfo.regime,
-      //     signal,
-      //     model_up: timeAware.adjustedUp,
-      //     model_down: timeAware.adjustedDown,
-      //     mkt_up: marketUp,
-      //     mkt_down: marketDown,
-      //     edge_up: edge.edgeUp,
-      //     edge_down: edge.edgeDown,
-      //     recommendation: `${rec.side}:${rec.phase}:${rec.strength}`,
-      //     side: rec.side,
-      //     strikeAtOpen: priceToBeatState.value,
-      //     edge: rec.edge
-      //   });
-      //   }
-      // }
-
       const binanceSpotBaseLine = colorPriceLine({ label: "BTC (Binance)", price: spotPrice, prevPrice: prevSpotPrice, decimals: 0, prefix: "$" });
       const diffLine = (spotPrice !== null && currentPrice !== null && Number.isFinite(spotPrice) && Number.isFinite(currentPrice) && currentPrice !== 0)
         ? (() => {
@@ -1250,38 +1190,72 @@ async function main() {
       //   )
       // : kv("Carteira:", `${ANSI.gray}-${ANSI.reset}`);
 
+      // Pega os dados de debug que configuramos no Engine
+      const debug = rec.debug || {};
+      const sideColor = rec.side === "UP" ? ANSI.green : (rec.side === "DOWN" ? ANSI.red : ANSI.gray);
+      const displacementPct = Math.abs(currentPrice - priceToBeat) / priceToBeat;
+      // --- CÁLCULO DOS GATILHOS (UP/DOWN) ---
+      const minReq = debug.minRequired || 0.00045; // Pega o valor dinâmico do engine ou 0.045% default
+      const targetUP = priceToBeat * (1 + minReq);
+      const targetDOWN = priceToBeat * (1 - minReq);
+
+
+
+      // Formatação amigável das métricas individuais
+      const scoreStatus = `${scored.score.toFixed(2)} / ${debug.minScore || 0.45}`;
+      const distStatus = `${(displacementPct * 100).toFixed(4)}% / ${(debug.minRequiredPct || 0.045)}%`;
+      // const haStatus = `${heikenColor === 'green' ? ANSI.green : ANSI.red}${heikenColor.toUpperCase()}${ANSI.reset} (1m/5m)}`;
+
       const polyBlock = [
         kv("POLYMARKET:", polyHeaderValue),
         // walletLine,
         kv("Recomendacao:", recommendationText),
         liveEntryStatus ? kv("Status Trade:", liveEntryStatus) : null,
         kv("Advisor:", advisorLine),
+        // --- SEÇÃO DE GATILHO (O QUE FALTA) ---
+      
+        `${ANSI.gray}── ALVOS DE ENTRADA (COLCHÃO) ────────────────────${ANSI.reset}`,
+        priceToBeat !== null ? kv("PRECO INICIAL:", `$${formatNumber(priceToBeat, 0)}`) : kv("PRECO INICIAL:", `${ANSI.gray}-${ANSI.reset}`),
+        currentPriceLine,
+        kv("PREÇO P/ ENTRAR:", debug.targetPrice ? `${sideColor}$${debug.targetPrice}${ANSI.reset}` : '-'),
+        kv("COLCHÃO/DIST:", `${displacementPct < (debug.minRequired || 0) ? ANSI.yellow : ANSI.green}${distStatus}${ANSI.reset}`),
+        // Mostra sempre os dois alvos com cores distintas
+        kv("TARGET UP 🟢:", `${ANSI.green}$${formatNumber(targetUP, 2)}${ANSI.reset}`),
+        kv("TARGET DOWN 🔴:", `${ANSI.red}$${formatNumber(targetDOWN, 2)}${ANSI.reset}`),
+
+        `${ANSI.gray}──────────────────────────────────────────────────${ANSI.reset}`,
+        priceToBeat !== null ? kv("STRIKE (ALVO):", `${ANSI.white}$${formatNumber(priceToBeat, 0)}${ANSI.reset}`) : null,
         // kv("Sinal para entrar:", actionLine),
         kv("Spread:", spread !== null ? `${formatNumber(spread, 0)}¢` : "-"),
         liquidity !== null ? kv("Liquidez:", formatNumber(liquidity, 0)) : null,
         settlementLeftMin !== null ? kv("Tempo restante:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
-        priceToBeat !== null ? kv("PRECO A SUPERAR:", `$${formatNumber(priceToBeat, 0)}`) : kv("PRECO A SUPERAR:", `${ANSI.gray}-${ANSI.reset}`),
-        currentPriceLine
       ].filter((x) => x !== null);
 
       let entryBlock = [];
 
       if (lastEntry && poly.ok) {
-        // const exit = await checkAutoExit({ lastEntry, poly });
+        const currentTokenPrice = lastEntry.side === "UP" ? poly.prices.up : poly.prices.down;
+        if (Number.isFinite(currentTokenPrice) && lastEntry.entryPrice) {
+            const pnlPct = (currentTokenPrice - lastEntry.entryPrice) / lastEntry.entryPrice;
 
-        // if (exit) {
-        //   const btcClose = currentPrice;
+            if (pnlPct <= -0.48) {
+                console.log(`\n🛑 STOP LOSS DISPARADO: ${(pnlPct * 100).toFixed(2)}%`);
+                await executeOrder({
+                    tokenId: lastEntry.tokenId,
+                    price: Math.max(0.01, currentTokenPrice - 0.02), // Venda agressiva
+                    size: lastEntry.size,
+                    side: "SELL"
+                });
 
-        //   await finalizeTrade(
-        //     {
-        //       timestamp: new Date().toISOString(),
-        //       side: lastEntry.side,
-        //       entry_price: lastEntry.entryPrice,
-        //       strikeAtOpen: lastEntry.strikeAtOpen
-        //     },
-        //     btcClose
-        //   );
-        // }
+                appendCsvRow("./logs/trade_results.csv", tradeTableHeader, [
+                    new Date().toISOString(), lastEntry.side, lastEntry.entryPrice, 
+                    lastEntry.strikeAtOpen, currentPrice ?? spotPrice, "PERDA (SL)"
+                ]);
+
+                pendingSignals.delete(timing.endMs);
+                lastEntry = null;
+            }
+        }
       }
 
       if (lastEntry) {
@@ -1320,6 +1294,8 @@ async function main() {
         ];
       }
 
+      
+
       const lines = [
         titleLine,
         marketLine,
@@ -1356,6 +1332,60 @@ async function main() {
 
       renderScreen(lines.join("\n") + "\n");
 
+//       const BORDER = { tl: "┌", tr: "┐", bl: "└", br: "┘", h: "─", v: "│", ml: "├", mr: "┤", mt: "┬", mb: "┴" };
+// // --- MONTAGEM DO PAINEL PROTEGIDA ---
+// const w = 64; 
+// const sep = BORDER.h.repeat(w - 2);
+
+// // Função para garantir que o repeat nunca receba valor negativo
+// const safeRepeat = (char, count) => char.repeat(Math.max(0, count));
+
+// const row = (l1, v1, l2, v2) => {
+//     // Truncar valores se forem grandes demais para a coluna
+//     const cleanV1 = stripAnsi(v1).slice(0, 18);
+//     const cleanV2 = stripAnsi(v2).slice(0, 18);
+//     return `${BORDER.v} ${padLabel(l1, 10)}${v1.padEnd(18 + (v1.length - stripAnsi(v1).length))} ${BORDER.v} ${padLabel(l2, 10)}${v2.padEnd(18 + (v2.length - stripAnsi(v2).length))} ${BORDER.v}`;
+// };
+
+// // Limitar o tamanho dos textos dinâmicos
+// const cleanAdvisor = advisorLine.slice(0, 40);
+// const cleanSignals = signalSummaryLine.slice(0, 45);
+
+// let dashboard = [
+//     `${ANSI.white}${BORDER.tl}${sep}${BORDER.tr}${ANSI.reset}`,
+//     `${BORDER.v}${centerText(`${ANSI.white}${String(poly.market?.question ?? "-").slice(0, w-4)}${ANSI.reset}`, w - 2)}${BORDER.v}`,
+//     `${BORDER.v}${centerText(`${timeColor}● EXPIRA EM: ${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`, w - 2)}${BORDER.v}`,
+//     `${ANSI.white}${BORDER.ml}${BORDER.h.repeat(29)}${BORDER.mt}${BORDER.h.repeat(31)}${BORDER.mr}${ANSI.reset}`,
+//     row("RSI", rsiLine.split(": ")[1] || "-", "POLY UP", `${ANSI.green}${marketUpStr}${ANSI.reset}`),
+//     row("MACD", macdLine.split(": ")[1] || "-", "POLY DOWN", `${ANSI.red}${marketDownStr}${ANSI.reset}`),
+//     row("VWAP", vwapLine.split(": ")[1] || "-", "DISTANCIA", ptbDeltaText),
+//     `${ANSI.white}${BORDER.ml}${BORDER.h.repeat(29)}${BORDER.mb}${BORDER.h.repeat(31)}${BORDER.mr}${ANSI.reset}`,
+//     `${BORDER.v} ${padLabel("ADVISOR:", 12)} ${cleanAdvisor}${safeRepeat(" ", w - stripAnsi(cleanAdvisor).length - 16)}${BORDER.v}`,
+//     `${BORDER.v} ${padLabel("SINAIS:", 12)} ${cleanSignals}${safeRepeat(" ", w - stripAnsi(cleanSignals).length - 16)}${BORDER.v}`,
+// ];
+
+// const marketSlugShort = poly.market?.slug?.split('-').slice(-2).join('-') || "N/A";
+// dashboard.push(`${BORDER.v}${centerText(`${ANSI.gray}ID: ${marketSlugShort} | LIQ: $${formatNumber(poly.market?.liquidityNum, 0)}${ANSI.reset}`, w - 2)}${BORDER.v}`);
+
+
+// if (lastEntry) {
+//     const entryText = `⚠ TRADE: ${lastEntry.side} @ $${lastEntry.entryPrice}`;
+//     dashboard.push(`${ANSI.white}${BORDER.ml}${sep}${BORDER.mr}${ANSI.reset}`);
+//     dashboard.push(`${BORDER.v} ${ANSI.yellow}${entryText}${safeRepeat(" ", w - stripAnsi(entryText).length - 4)}${ANSI.reset}${BORDER.v}`);
+// }
+
+// dashboard.push(`${ANSI.white}${BORDER.bl}${sep}${BORDER.br}${ANSI.reset}`);
+
+// if (orderStatus) {
+//     const statusLine = ` ORDER: ${orderStatus}`;
+//     dashboard.push(`${ANSI.white}${BORDER.ml}${sep}${BORDER.mr}${ANSI.reset}`);
+//     dashboard.push(`${BORDER.v}${statusLine}${safeRepeat(" ", w - stripAnsi(statusLine).length - 2)}${BORDER.v}`);
+// }
+
+// dashboard.push(`${ANSI.white}${BORDER.bl}${sep}${BORDER.br}${ANSI.reset}`);
+
+// renderScreen(dashboard.join("\n") + "\n");
+
       prevSpotPrice = spotPrice ?? prevSpotPrice;
       prevCurrentPrice = currentPrice ?? prevCurrentPrice;
 
@@ -1372,45 +1402,31 @@ async function main() {
   }
 
   async function checkAutoExit({ lastEntry, poly }) {
-    if (!lastEntry) return;
+    if (!lastEntry) return null;
 
-    const currentPrice = lastEntry.side === "UP"
+    // Pega o preço atual do token (UP ou DOWN)
+    const currentTokenPrice = lastEntry.side === "UP"
       ? poly.prices.up
       : poly.prices.down;
 
-    if (!Number.isFinite(currentPrice)) return;
+    if (!Number.isFinite(currentTokenPrice) || !lastEntry.entryPrice) return null;
 
     const entry = lastEntry.entryPrice;
+    const pnlPct = (currentTokenPrice - entry) / entry;
 
-    const pnlPct = (currentPrice - entry) / entry;
+    // --- BLOCO DE TAKE PROFIT REMOVIDO ---
+    // O robô agora segura a operação até o fechamento do candle.
 
-    // 🧠 ajuste para DOWN
-    const adjustedPnl = lastEntry.side === "UP"
-      ? pnlPct
-      : -pnlPct;
-
-    // 🎯 TAKE PROFIT
-    if (adjustedPnl >= 0.25) {
-      console.log("💰 TAKE PROFIT atingido!", adjustedPnl);
-      const exitPrice = Math.max(0.01, currentPrice - 0.01);
-
-      await executeOrder({
-        tokenId: lastEntry.tokenId,
-        price: exitPrice,
-        size: lastEntry.size,
-        side: "SELL"
-      });
-
-      return "EXIT_TP";
-    }
-
-    // 🛑 STOP LOSS (opcional)
-    if (adjustedPnl <= -0.15) {
-      console.log("🛑 STOP LOSS!", adjustedPnl);
+    // 🛑 STOP LOSS (Mantido em 65% de perda)
+    if (pnlPct <= -0.65) {
+      console.log(`🛑 STOP LOSS ACIONADO: ${(pnlPct * 100).toFixed(2)}%`);
+      
+      // Venda de pânico: 2 cents abaixo do preço de mercado para garantir a saída
+      const panicExitPrice = Math.max(0.01, currentTokenPrice - 0.02);
 
       await executeOrder({
         tokenId: lastEntry.tokenId,
-        price: currentPrice,
+        price: panicExitPrice,
         size: lastEntry.size,
         side: "SELL"
       });

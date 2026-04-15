@@ -3,7 +3,7 @@ import path from "node:path";
 import ExcelJS from "exceljs";
 import { ensureDir } from "./utils.js";
 
-const DEFAULT_EXCEL_FILE = "./logs/entradas.xlsx";
+const DEFAULT_EXCEL_FILE = "./logs/entradas.csv";
 const DEFAULT_SHEET = "Entradas";
 const DEFAULT_PARAMS_SHEET = "Parametros";
 

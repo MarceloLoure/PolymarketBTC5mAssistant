@@ -11,6 +11,7 @@
     "dotenv": "^17.4.2",
     "ethers": "^5.7.2",
     "exceljs": "^4.4.0",
+    "fs": "^0.0.1-security",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",
     "undici": "^6.21.3",

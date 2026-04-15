@@ -1,366 +1,97 @@
 import { learningState } from "./learningState.js";
 
+// engines/polymarketSkill.js
+
 export function polymarketPropEngine(input) {
   const {
-    timeLeftMin,
-    score,
-    bullCount = 0,
-    bearCount = 0,
-    marketUp,
-    marketDown,
-    modelUp,
-    modelDown,
-    currentPrice,
-    priceToBeat,
-    rsi
+    timeLeftMin, score, bullCount, bearCount,
+    marketUp, marketDown, modelUp, modelDown,
+    currentPrice, priceToBeat, rsi,
+    regime, heikenColor, heikenColor5m
   } = input;
 
-  // =========================
-  // 1. VALIDATION
-  // =========================
-  if (
-    timeLeftMin == null ||
-    marketUp == null ||
-    marketDown == null ||
-    modelUp == null ||
-    modelDown == null
-  ) {
-    return { action: "NO_TRADE", reason: "DADOS INSUFICIENTES" };
+  // 1. VALIDAÇÃO E TRAVA DE SEGURANÇA (TIME LOCK)
+  if (timeLeftMin == null || !marketUp || !modelUp || !priceToBeat) {
+    return { action: "NO_TRADE", reason: "DADOS_INCOMPLETOS" };
   }
-
-  // =========================
-  // 2. PHASE (prop logic)
-  // =========================
-  let phase = "EARLY";
-  if (timeLeftMin > 5) phase = "EARLY";
-  else if (timeLeftMin > 2) phase = "MID";
-  else if (timeLeftMin > 0.5) phase = "LATE";
-  else phase = "FINAL";
-
-  // =========================
-  // 3. DIRECTION
-  // =========================
-  const modelBias = modelUp - modelDown;
-  const marketBias = marketUp - marketDown;
-  const scoreBias = score;
-
-  const directionScore = modelBias + marketBias + scoreBias;
-
-  const side = directionScore > 0 ? "UP" : "DOWN";
-
   
+  // Bloqueia se faltar menos de 42 segundos para evitar slippage e volatilidade final
+  if (timeLeftMin <= 0.7) return { action: "NO_TRADE", reason: "JANELA_MUITO_CURTA" };
 
-  // =========================
-  // DISPLACEMENT 2.0 FLEX (V3)
-  // =========================
-
+  // 2. FILTRO DE ALINHAMENTO TRIPLO (DIREÇÃO + MOMENTUM)
   const delta = currentPrice - priceToBeat;
-  const displacementPct = Math.abs(delta) / priceToBeat;
+  const side = delta > 0 ? "UP" : "DOWN";
 
-  // base por fase (bem mais leve agora)
-  const baseRequiredByPhase = {
-    EARLY: 0.0008, // 0.08%
-    MID:   0.0012,
-    LATE:  0.0016,
-    FINAL: 0.0020
-  };
+  // Só entra se o Lado do trade bater com a cor do Heiken Ashi 1m e 5m (Assertividade Máxima)
+  const isSideAligned = (side === "UP" && heikenColor === "green" && heikenColor5m === "green") ||
+                        (side === "DOWN" && heikenColor === "red" && heikenColor5m === "red");
 
-  let required = baseRequiredByPhase[phase] ?? 0.0012;
-
-  // =========================
-  // 1. SCORE ADAPTATION (trend strength)
-  // =========================
-  const absScore = Math.abs(score);
-
-  if (absScore > 0.7) required *= 0.75;  // forte tendência → menos exigência
-  else if (absScore < 0.3) required *= 1.4; // chop → exige mais movimento
-
-  // =========================
-  // 2. VOLATILITY ADAPTATION (market behavior)
-  // =========================
-  const volatility = Math.abs(marketUp - marketDown);
-
-  if (volatility > 0.08) required *= 0.8;  // mercado agressivo
-  if (volatility < 0.03) required *= 1.3;  // mercado parado
-
-  // =========================
-  // 3. RSI EXTREMES (boost permission)
-  // =========================
-  if (rsi != null) {
-    if (rsi > 70 || rsi < 30) {
-      required *= 0.85; // deixa entrar mais fácil em extremos
-    }
+  if (!isSideAligned) {
+    return { action: "NO_TRADE", reason: `HA_CONTRA_DIRECAO (${heikenColor}/${heikenColor5m})` };
   }
 
-  const marketProbUp = marketUp;
-  const marketProbDown = marketDown;
+  // 3. COLCHÃO DE SEGURANÇA COM "TREND BOOST"
+  const absDelta = Math.abs(delta);
+  const displacementPct = absDelta / priceToBeat;
+  
+  // Base de distância por fase
+  let minRequired = timeLeftMin > 3 ? 0.0005 : (timeLeftMin > 1.5 ? 0.0008 : 0.0012);
 
-  // =========================
-  // EXTREME PROBABILITY ZONE (BIDIRECTIONAL)
-  // =========================
+  // REDUÇÃO DE EXIGÊNCIA: Se a tendência é muito forte (score > 0.75), afrouxamos o colchão em 30%
+  if (Math.abs(score) > 0.75) {
+    minRequired *= 0.7; 
+  }
 
-  // 🔥 ZONA EXTREMA UP (crowded long)
-  if (marketProbUp > 0.87) {
+  const targetPrice = side === "UP" 
+    ? priceToBeat * (1 + minRequired) 
+    : priceToBeat * (1 - minRequired);
 
-    const modelAgreement = modelUp > modelDown;
-
-    if (!modelAgreement || score < 0.4) {
-      return {
-        action: "NO_TRADE",
-        reason: "EXTREME UP ZONE (OVERPRICED LONG)",
-        debug: {
-          marketProbUp,
-          modelUp,
-          score
-        }
-      };
-    }
-
-    if (score > 0.7 && modelUp > 0.6) {
-      return {
-        action: "ENTER",
-        side: "UP",
-        reason: "EXTREME UP CONTINUATION",
-        note: "crowded long but momentum strong"
-      };
-    }
-
-    return {
-      action: "NO_TRADE",
-      reason: "EXTREME UP - WAIT CONFIRMATION",
+  if (displacementPct < minRequired) {
+    return { 
+      action: "NO_TRADE", 
+      reason: `ABAIXO_DO_COLCHAO_SEGURANCA (${(displacementPct*100).toFixed(4)}%)`,
       debug: {
-        marketProbUp,
-        score
+        targetPrice: targetPrice.toFixed(2),
+        minRequiredPct: (minRequired * 100).toFixed(2) + "%"
       }
     };
   }
 
-  // =========================
-  // 🔥 ZONA EXTREMA DOWN (crowded short)
-  // =========================
-  if (marketProbDown > 0.85) {
+  // 4. CONFLUÊNCIA DE SINAIS (SCORE + COUNT)
+  const minScore = timeLeftMin > 3 ? 0.45 : 0.55;
+  const sideScore = side === "UP" ? score : -score;
+  const sideCount = side === "UP" ? bullCount : bearCount;
 
-    const modelAgreement = modelDown > modelUp;
-
-    if (!modelAgreement || score < 0.4) {
-      return {
-        action: "NO_TRADE",
-        reason: "EXTREME DOWN ZONE (OVERPRICED SHORT)",
-        debug: {
-          marketProbDown,
-          modelDown,
-          score
-        }
-      };
-    }
-
-    if (score > 0.7 && modelDown > 0.6) {
-      return {
-        action: "ENTER",
-        side: "DOWN",
-        reason: "EXTREME DOWN CONTINUATION",
-        note: "crowded short but momentum strong"
-      };
-    }
-
-    return {
-      action: "NO_TRADE",
-      reason: "EXTREME DOWN - WAIT CONFIRMATION",
-      debug: {
-        marketProbDown,
-        score
-      }
-    };
+  if (sideScore < minScore || sideCount < 4) {
+    return { action: "NO_TRADE", reason: `CONFLUENCIA_INSUFICIENTE (Score: ${sideScore.toFixed(2)})` };
   }
 
-  // =========================
-  // 4. FINAL SCORE
-  // =========================
-  const displacementScore = displacementPct / required;
+  // 5. EDGE DINÂMICO (FILTRO DE PREÇO JUSTO)
+  const myProb = side === "UP" ? modelUp : modelDown;
+  const marketPrice = side === "UP" ? marketUp : marketDown;
+  const edge = myProb - marketPrice;
+  const EV = (myProb * 1) - marketPrice;
 
-  // =========================
-  // 5. ZONE (não binário)
-  // if (displacementScore < 0.5) {
-  //   return {
-  //     action: "NO_TRADE",
-  //     reason: "INSUFFICIENT DISPLACEMENT",
-  //     debug: {
-  //       displacementPct,
-  //       required,
-  //       score: displacementScore,
-  //       phase
-  //     }
-  //   };
-  // }
+  // Se o token estiver "caro" (>0.50), exigimos um Edge maior (6%) para compensar o risco
+  const requiredEdge = marketPrice > 0.50 ? 0.06 : 0.045;
 
-// opcional: warning zone (sem bloquear)
-const isWeak = displacementScore < 0.8;
-
-  // =========================
-  // 5. CONFLUENCE FILTER
-  // =========================
-
-  const modelBiasNorm =
-    modelUp - modelDown;
-
-  const marketBiasNorm =
-    marketUp - marketDown;
-
-  const alignmentScore =
-    modelBiasNorm * 0.65 +
-    marketBiasNorm * 0.35;
-
-  // força direcional real
-  const alignmentStrength = Math.abs(alignmentScore);
-
-  // 🔥 threshold dinâmico (isso muda tudo)
-  const minAlignment =
-    phase === "EARLY" ? 0.05 :
-    phase === "MID"   ? 0.065 :
-    phase === "LATE"  ? 0.07 :
-                        0.09;
-
-  // ❌ só bloqueia se estiver MUITO fraco
-  if (alignmentStrength < minAlignment) {
-    return {
-      action: "NO_TRADE",
-      reason: `WEAK ALIGNMENT (SCORE ${alignmentScore.toFixed(3)}) - BELOW THRESHOLD ${minAlignment}`,
-      debug: {
-        alignmentScore,
-        alignmentStrength,
-        minAlignment,
-        phase
-      }
-    };
+  if (edge < requiredEdge || EV < 0.02) {
+    return { action: "NO_TRADE", reason: "EDGE_INSUFICIENTE_PARA_PRECO_ALTO" };
   }
 
-  // =========================
-  // 6. SCORE FILTER (PROP GRADE)
-  // =========================
-
-  const minScore =
-    phase === "EARLY" ? 0.50 :
-    phase === "MID"   ? 0.40 :
-    phase === "LATE"  ? 0.35 :
-                        0.3;
-
-  // leve penalidade por desalinhamento fraco
-  const alignmentPenalty =
-    alignmentStrength < 0.1 ? 0.05 : 0;
-
-  const adjustedScore = Math.abs(score) - alignmentPenalty;
-
-  if (adjustedScore < minScore) {
-    return {
-      action: "NO_TRADE",
-      reason: `SCORE BAIXO (AJUSTADO ${adjustedScore.toFixed(3)} < MIN ${minScore})`,
-      debug: {
-        score,
-        adjustedScore,
-        minScore,
-        alignmentStrength
-      }
-    };
+  // 6. FILTROS DE EXAUSTÃO
+  if ((side === "UP" && rsi > 70) || (side === "DOWN" && rsi < 30)) {
+    return { action: "NO_TRADE", reason: "EXAUSTAO_RSI_DETECTADA" };
   }
 
-  // =========================
-  // 7. MARKET MICROSTRUCTURE FILTER
-  // =========================
-  const spread = Math.abs(marketUp - marketDown);
-
-  if (spread > 6) {
-    return {
-      action: "NO_TRADE",
-      reason: "SPREAD ALTO",
-      debug: { spread }
-    };
-  }
-
-  // =========================
-  // 8. EDGE CALCULATION
-  // =========================
-  const probUp = modelUp;
-  const probDown = modelDown;
-
-  const edge =
-    side === "UP"
-      ? probUp - marketUp
-      : probDown - marketDown;
-
-  const MIN_EDGE =
-    phase === "EARLY" ? 0.04 :
-    phase === "MID"   ? 0.03 :
-    phase === "LATE"  ? 0.02 :
-                        0.015;
-
-  if (edge < MIN_EDGE) {
-    return {
-      action: "NO_TRADE",
-      reason: "SEM EDGE",
-      debug: { edge, minEdge: MIN_EDGE }
-    };
-  }
-
-  // =========================
-  // 9. EXPECTED VALUE (PROP CORE)
-  // =========================
-  const price = side === "UP" ? marketUp : marketDown;
-
-  const payout = 1;
-  const EV = (side === "UP" ? probUp : probDown) * payout - price;
-
-  const MIN_EV =
-    phase === "EARLY" ? 0.02 :
-    phase === "MID"   ? 0.015 :
-    phase === "LATE"  ? 0.01 :
-                        0.008;
-
-  if (EV < MIN_EV) {
-    return {
-      action: "NO_TRADE",
-      reason: "EV BAIXO",
-      debug: { ev: EV, minEv: MIN_EV }
-    };
-  }
-
-  // =========================
-  // 10. CONFLUENCE BOOST
-  // =========================
-  const bullBearImbalance =
-    bullCount + bearCount > 0
-      ? (bullCount - bearCount) / (bullCount + bearCount)
-      : 0;
-
-  const confluenceBoost =
-    Math.abs(bullBearImbalance) > 0.3 ? 0.05 : 0;
-
-  const finalScore =
-    (edge * 0.5) +
-    (EV * 0.3) +
-    (Math.abs(score) * 0.2) +
-    confluenceBoost;
-
-  // =========================
-  // 11. STRENGTH
-  // =========================
-  let strength = "WEAK";
-
-  if (finalScore > 0.08) strength = "STRONG";
-  else if (finalScore > 0.05) strength = "MEDIUM";
-
-  // =========================
-  // 12. FINAL
-  // =========================
   return {
     action: "ENTER",
     side,
-    phase,
+    phase: timeLeftMin > 3 ? "EARLY" : (timeLeftMin > 1.5 ? "MID" : "LATE"),
     edge,
     ev: EV,
-    prob: side === "UP" ? probUp : probDown,
-    score,
-    finalScore,
-    strength
+    score: Math.abs(score),
+    strength: Math.abs(score) > 0.75 ? "STRONG" : "MEDIUM"
   };
 }
 

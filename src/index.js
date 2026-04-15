@@ -642,6 +642,7 @@ async function main() {
       //   regime:           regimeInfo.regime    // NOVO
       // });
 
+      // Localize este bloco no seu index.js e atualize:
       const rec = polymarketPropEngine({
         timeLeftMin,
         score: scored.score,
@@ -649,11 +650,15 @@ async function main() {
         bearCount: scored.bearCount,
         marketUp,
         marketDown,
-        modelUp: timeAware.adjustedUp,   // ✔ obrigatório
-        modelDown: timeAware.adjustedDown, // ✔ obrigatório
+        modelUp: timeAware.adjustedUp,
+        modelDown: timeAware.adjustedDown,
         currentPrice,
         priceToBeat: priceToBeatState.value,
-        rsi: rsiNow
+        rsi: rsiNow,
+        // --- ADICIONE ESTAS LINHAS ABAIXO ---
+        regime: regimeInfo.regime, 
+        heikenColor: consec.color,    // Cor do HA 1m
+        heikenColor5m: consec5m.color // Cor do HA 5m
       });
 
       const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
@@ -781,8 +786,11 @@ async function main() {
       const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
 
       if (lastWindowStartMs !== null && timing.startMs !== lastWindowStartMs) {
+        // A janela que acabou de fechar terminou exatamente em timing.startMs
+        const closedWindowEndMs = timing.startMs; 
+
         tradeJournal.closeWindow({
-          windowEndMs: timing.startMs,
+          windowEndMs: closedWindowEndMs,
           candles,
           fallbackPrice: currentPrice ?? spotPrice,
           outcomePrices: {
@@ -790,72 +798,49 @@ async function main() {
             down: poly.ok ? poly.prices.down : null
           }
         });
-        tradeJournal.maybeSuggestParams();
-        lastEntry = null;
-        tradedThisCandle = false;
 
-        const pendings = pendingSignals.get(timing.endMs);
+        // 1. Pegar os sinais que estavam esperando o fechamento desta janela específica
+        const pendings = pendingSignals.get(closedWindowEndMs);
 
         if (pendings && pendings.length) {
+          // O preço de fechamento real para a Polymarket é o preço da Chainlink/Spot no exato momento do fim
+          const btcFinalPrice = currentPrice ?? spotPrice;
+
           for (const pending of pendings) {
-            const btcClose = pickClosePrice(candles, timing.startMs) ?? (Number.isFinite(currentPrice) ? currentPrice : spotPrice);
-            const strike = Number.isFinite(pending.strikeAtOpen) ? pending.strikeAtOpen : null;
+            const strike = pending.strikeAtOpen;
+            let result = "ERRO";
 
-            let result = "";
-
-            if (Number.isFinite(btcClose) && strike !== null) {
-              result = pending.side === "UP"
-                ? (btcClose > strike ? "GANHO" : "PERDA")
-                : (btcClose < strike ? "GANHO" : "PERDA");
+            if (Number.isFinite(btcFinalPrice) && strike !== null) {
+              // Lógica de Ganho/Perda
+              const isWin = pending.side === "UP" 
+                ? btcFinalPrice > strike 
+                : btcFinalPrice < strike;
+              
+              result = isWin ? "GANHO" : "PERDA";
             }
 
-            appendCsvRow("./logs/signals.csv", header, [
-              pending.timestamp,
-              pending.entry_minute,
-              pending.time_left_min,
-              pending.regime,
-              pending.signal,
-              pending.model_up,
-              pending.model_down,
-              pending.mkt_up,
-              pending.mkt_down,
-              pending.edge_up,
-              pending.edge_down,
-              pending.recommendation,
-              btcClose ?? "",
-              result
-            ]);
-
-            // =============================
-            // 📊 NOVA TABELA LIMPA (CANDLE RESULT)
-            // =============================
+            // 2. SALVAR NO trade_results.csv (Apenas uma vez, no fechamento real)
             appendCsvRow("./logs/trade_results.csv", tradeTableHeader, [
               pending.timestamp,
               pending.side,
               pending.entry_price ?? "",
-              pending.strikeAtOpen ?? "",
-              btcClose ?? "",
+              strike ?? "",
+              btcFinalPrice ?? "",
               result
             ]);
 
-            updateLearning({
-              trade: {
-                evExpected: pending.edge ?? 0, // 👈 MELHOR que lastEntry
-                result: result === "GANHO" ? 1 : -1,
-                pnl: result === "GANHO" ? 1 : -1
-              }
-            });
+            // Feedback no console
+            console.log(`${ANSI.white}--- JANELA ENCERRADA ---${ANSI.reset}`);
+            console.log(`Resultado: ${result === "GANHO" ? ANSI.green : ANSI.red}${result}${ANSI.reset} | Preço: ${btcFinalPrice}`);
           }
 
-          pendingSignals.delete(timing.endMs);
-
-          console.log("[AUTO-LEARNING]", {
-            edgeMin: learningState.edgeMin,
-            deltaLate: learningState.deltaMin.LATE,
-            winRate: (learningState.stats.wins / learningState.stats.totalTrades).toFixed(2),
-            pnl: learningState.stats.realPnL
-          });
+          // 3. Limpar os sinais processados
+          pendingSignals.delete(closedWindowEndMs);
         }
+
+        tradeJournal.maybeSuggestParams();
+        lastEntry = null;
+        tradedThisCandle = false;
       }
       lastWindowStartMs = timing.startMs;
 
@@ -968,7 +953,7 @@ async function main() {
       const RISK_PER_TRADE = 0.02; // 2%
 
       // 🧪 modo seguro
-      const PAPER_MODE = true;
+      const PAPER_MODE = false;
 
       // ⏱ cooldown
       const COOLDOWN = 60 * 1000;
@@ -1092,6 +1077,7 @@ async function main() {
         side: rec.side,
         entryPrice: safeEntryPrice,
         size, // 👈 importante pra sair depois
+        strikeAtOpen: priceToBeatState.value
       };
       lastEntryWindowEndMs = timing.endMs;
 
@@ -1115,22 +1101,13 @@ async function main() {
 
       pendingSignals.get(timing.endMs).push({
         timestamp: new Date().toISOString(),
-        entry_minute: Number.isFinite(timing.elapsedMinutes) ? timing.elapsedMinutes.toFixed(3) : "",
-        time_left_min: Number.isFinite(timeLeftMin) ? timeLeftMin.toFixed(3) : "",
-        regime: regimeInfo.regime,
-        signal,
-        model_up: timeAware.adjustedUp,
-        model_down: timeAware.adjustedDown,
-        mkt_up: marketUp,
-        mkt_down: marketDown,
-        edge_up: edge.edgeUp,
-        edge_down: edge.edgeDown,
-        recommendation: `${rec.side}:${rec.phase}:${rec.strength}`,
         side: rec.side,
-        strikeAtOpen: priceToBeatState.value,
-        edge: effectiveEdge,
         entry_price: safeEntryPrice,
+        strikeAtOpen: priceToBeatState.value, // O Strike da Polymarket no momento da entrada
+        edge: effectiveEdge
       });
+
+      tradedThisCandle = true;
     }
   }
 
@@ -1290,21 +1267,21 @@ async function main() {
       let entryBlock = [];
 
       if (lastEntry && poly.ok) {
-        const exit = await checkAutoExit({ lastEntry, poly });
+        // const exit = await checkAutoExit({ lastEntry, poly });
 
-        if (exit) {
-          const btcClose = currentPrice;
+        // if (exit) {
+        //   const btcClose = currentPrice;
 
-          await finalizeTrade(
-            {
-              timestamp: new Date().toISOString(),
-              side: lastEntry.side,
-              entry_price: lastEntry.entryPrice,
-              strikeAtOpen: lastEntry.strikeAtOpen
-            },
-            btcClose
-          );
-        }
+        //   await finalizeTrade(
+        //     {
+        //       timestamp: new Date().toISOString(),
+        //       side: lastEntry.side,
+        //       entry_price: lastEntry.entryPrice,
+        //       strikeAtOpen: lastEntry.strikeAtOpen
+        //     },
+        //     btcClose
+        //   );
+        // }
       }
 
       if (lastEntry) {

@@ -18,113 +18,100 @@ export function polymarketPropEngine(input, historicalCandles) {
   } = input;
 
   const boundaries = getMarketBoundaries(historicalCandles);
+  const delta = currentPrice - priceToBeat;
+  const side = delta > 0 ? "UP" : "DOWN";
+  const marketPrice = side === "UP" ? marketUp : marketDown;
 
-  if (timeLeftMin <= 0.5 && timeLeftMin > 0.15) {
-      const marketPrice = (currentPrice > priceToBeat ? marketUp : marketDown);
-      if (marketPrice > 0.82 && Math.abs(score) > 0.80) {
-          return { action: "ENTER", side: currentPrice > priceToBeat ? "UP" : "DOWN", phase: "SUPER_SNIPER" };
-      }
+  // ==========================================================
+  // 🔥 FILTRO DE SOBREVIVÊNCIA (ANTI-SUICÍDIO 0.99)
+  // ==========================================================
+  // Não entramos se o lucro for ridículo comparado ao risco do Stop Loss.
+  if (marketPrice > 0.80) {
+    return { action: "NO_TRADE", reason: "RISCO_RETORNO_RUIM", debug: { price: marketPrice } };
+  }
+  // Se o mercado acha que a chance é menor que 25%, ele sabe de algo que nós não sabemos.
+  if (marketPrice < 0.25) {
+    return { action: "NO_TRADE", reason: "MUITO_CONTRA_FLUXO", debug: { price: marketPrice } };
   }
 
-  // 1. VALIDAÇÃO E TRAVA DE SEGURANÇA (TIME LOCK)
+  // 1. VALIDAÇÃO BÁSICA
   if (timeLeftMin == null || !marketUp || !modelUp || !priceToBeat) {
     return { action: "NO_TRADE", reason: "DADOS_INCOMPLETOS" };
   }
-  
-  // Bloqueia se faltar menos de 42 segundos para evitar slippage e volatilidade final
-  // if (timeLeftMin <= 0.7) return { action: "NO_TRADE", reason: "JANELA_MUITO_CURTA" };
 
-  // 2. FILTRO DE ALINHAMENTO TRIPLO (DIREÇÃO + MOMENTUM)
-  const delta = currentPrice - priceToBeat;
-  const side = delta > 0 ? "UP" : "DOWN";
+  // 2. SNIPER DE FINAL DE CANDLE (Aumentamos a exigência de 0.80 para 0.88)
+  if (timeLeftMin <= 0.5 && timeLeftMin > 0.15) {
+      if (marketPrice > 0.75 && Math.abs(score) > 0.88) {
+          return { action: "ENTER", side, phase: "SUPER_SNIPER", score: Math.abs(score) };
+      }
+      return { action: "NO_TRADE", reason: "JANELA_FINAL_SEM_CONVICCAO" };
+  }
 
-  // // Só entra se o Lado do trade bater com a cor do Heiken Ashi 1m e 5m (Assertividade Máxima)
-  // const isSideAligned = (side === "UP" && heikenColor === "green" && heikenColor5m === "green") ||
-  //                       (side === "DOWN" && heikenColor === "red" && heikenColor5m === "red");
-
-  // if (!isSideAligned) {
-  //   return { action: "NO_TRADE", reason: `HA_CONTRA_DIRECAO (${heikenColor}/${heikenColor5m})` };
-  // }
-
-  // Agora exigimos apenas o alinhamento de 1 minuto (heikenColor)
-  // O de 5 minutos (heikenColor5m) vira apenas um bônus no score, não um bloqueio.
-  const isSideAligned = (side === "UP" && heikenColor === "green") ||
-                        (side === "DOWN" && heikenColor === "red");
+  // 3. FILTRO HEIKEN ASHI (Voltamos para 1m + 5m para estancar o sangue dos logs)
+  const isSideAligned = (side === "UP" && heikenColor === "green" && heikenColor5m === "green") ||
+                        (side === "DOWN" && heikenColor === "red" && heikenColor5m === "red");
 
   if (!isSideAligned) {
-    return { 
-      action: "NO_TRADE", 
-      reason: `HA_1M_CONTRA (${heikenColor.toUpperCase()})`,
-      debug: { currentHA: heikenColor }
-    };
+    return { action: "NO_TRADE", reason: `HA_CONTRA_DIRECAO (${heikenColor}/${heikenColor5m})` };
   }
 
+  // 4. RESISTÊNCIA/SUPORTE (PROTEÇÃO DE TOPO/FUNDO)
   if (side === "UP" && currentPrice >= boundaries.max * 0.9999) {
-      return { action: "NO_TRADE", reason: "RESISTENCIA_HISTORICA_DETECTADA" };
+      if (regime !== "STRONG_TREND" || Math.abs(score) < 0.85) 
+        return { action: "NO_TRADE", reason: "TOPO_HISTORICO_SEM_FORCA" };
+  }
+  if (side === "DOWN" && currentPrice <= boundaries.min * 1.0001) {
+      if (regime !== "STRONG_TREND" || Math.abs(score) < 0.85)
+        return { action: "NO_TRADE", reason: "FUNDO_HISTORICO_SEM_FORCA" };
   }
 
-  // 3. COLCHÃO DE SEGURANÇA COM "TREND BOOST"
+  // 5. COLCHÃO DE SEGURANÇA (Aumentamos levemente para evitar ruído)
   const absDelta = Math.abs(delta);
   const displacementPct = absDelta / priceToBeat;
-  
-  // Base de distância por fase
-  let minRequired = timeLeftMin > 3 ? 0.00045 : (timeLeftMin > 1.5 ? 0.0007 : 0.0011);
+  let minRequired = timeLeftMin > 3 ? 0.00055 : (timeLeftMin > 1.5 ? 0.0008 : 0.0012);
 
-  // REDUÇÃO DE EXIGÊNCIA: Se a tendência é muito forte (score > 0.75), afrouxamos o colchão em 30%
-  if (Math.abs(score) > 0.75) {
-    minRequired *= 0.7; 
-  }
-
-  const targetPrice = side === "UP" 
-    ? priceToBeat * (1 + minRequired) 
-    : priceToBeat * (1 - minRequired);
+  if (Math.abs(score) > 0.80) minRequired *= 0.75; 
 
   if (displacementPct < minRequired) {
     return { 
       action: "NO_TRADE", 
-      reason: `ABAIXO_DO_COLCHAO_SEGURANCA (${(displacementPct*100).toFixed(4)}% - Desejado: ${(minRequired*100).toFixed(2)}%) Esperando ${side === "UP" ? "acima de" : "abaixo de"} ${targetPrice.toFixed(2)}`,
-      debug: {
-        targetPrice: targetPrice.toFixed(2),
-        minRequiredPct: (minRequired * 100).toFixed(2) + "%"
-      }
+      reason: "COLCHAO_INSUFICIENTE",
+      debug: { targetPrice: (priceToBeat * (side === "UP" ? 1+minRequired : 1-minRequired)).toFixed(2), minRequired }
     };
   }
 
-  // 4. CONFLUÊNCIA DE SINAIS (SCORE + COUNT)
-  const minScore = timeLeftMin > 3 ? 0.45 : 0.55;
+  // 6. CONFLUÊNCIA E EDGE (A "ZONA 0.52")
   const sideScore = side === "UP" ? score : -score;
-  const sideCount = side === "UP" ? bullCount : bearCount;
+  const minScore = timeLeftMin > 3 ? 0.45 : 0.55;
 
-  if (sideScore < minScore || sideCount < 4) {
-    return { action: "NO_TRADE", reason: `CONFLUENCIA_INSUFICIENTE (Score: ${sideScore.toFixed(2)} - Desejado: ${minScore.toFixed(2)}) Esperando ${side === "UP" ? "acima de" : "abaixo de"} ${targetPrice.toFixed(2)}` }; 
+  if (sideScore < minScore || (side === "UP" ? bullCount : bearCount) < 4) {
+    return { action: "NO_TRADE", reason: "SINAIS_INSUFICIENTES" };
   }
 
-  // 5. EDGE DINÂMICO (FILTRO DE PREÇO JUSTO)
   const myProb = side === "UP" ? modelUp : modelDown;
-  const marketPrice = side === "UP" ? marketUp : marketDown;
   const edge = myProb - marketPrice;
   const EV = (myProb * 1) - marketPrice;
 
-  // Se o token estiver "caro" (>0.50), exigimos um Edge maior (6%) para compensar o risco
-  const requiredEdge = marketPrice > 0.50 ? 0.06 : 0.045;
+  // Na zona de 0.50, aceitamos um Edge menor. Se for caro, exigimos 8%!
+  const requiredEdge = marketPrice > 0.65 ? 0.08 : 0.045;
 
   if (edge < requiredEdge || EV < 0.02) {
-    return { action: "NO_TRADE", reason: "EDGE_INSUFICIENTE_PARA_PRECO_ALTO" };
+    return { action: "NO_TRADE", reason: "SEM_VANTAGEM_MATEMATICA" };
   }
 
-  // 6. FILTROS DE EXAUSTÃO
-  if ((side === "UP" && rsi > 70) || (side === "DOWN" && rsi < 30)) {
-    return { action: "NO_TRADE", reason: "EXAUSTAO_RSI_DETECTADA" };
+  // 7. RSI FINAL
+  if ((side === "UP" && rsi > 72) || (side === "DOWN" && rsi < 28)) {
+    return { action: "NO_TRADE", reason: "MERCADO_EXAUSTO" };
   }
 
   return {
     action: "ENTER",
     side,
-    phase: timeLeftMin > 3 ? "EARLY" : (timeLeftMin > 1.5 ? "MID" : "LATE"),
+    phase: timeLeftMin > 3 ? "EARLY" : "MID",
     edge,
     ev: EV,
     score: Math.abs(score),
-    strength: Math.abs(score) > 0.75 ? "STRONG" : "MEDIUM"
+    strength: Math.abs(score) > 0.80 ? "STRONG" : "MEDIUM"
   };
 }
 

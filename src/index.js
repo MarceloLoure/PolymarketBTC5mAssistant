@@ -971,7 +971,7 @@ async function main() {
       const RISK_PER_TRADE = 0.02; // 2%
 
       // 🧪 modo seguro
-      const PAPER_MODE = false;
+      const PAPER_MODE = true; // true para simulação, false para operar de verdade
 
       // ⏱ cooldown
       const COOLDOWN = 60 * 1000;
@@ -1238,7 +1238,7 @@ async function main() {
         if (Number.isFinite(currentTokenPrice) && lastEntry.entryPrice) {
             const pnlPct = (currentTokenPrice - lastEntry.entryPrice) / lastEntry.entryPrice;
 
-            if (pnlPct <= -0.48) {
+            if (pnlPct <= -0.75) { // Stop Loss em 75% de perda
                 console.log(`\n🛑 STOP LOSS DISPARADO: ${(pnlPct * 100).toFixed(2)}%`);
                 await executeOrder({
                     tokenId: lastEntry.tokenId,
